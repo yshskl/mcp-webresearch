@@ -253,10 +253,25 @@ async function safePageNavigation(page: Page, url: string): Promise<void> {
 
 // Helper function to ensure browser is running
 async function ensureBrowser() {
-  if (!browser) {
-    try {
+  try {
+    // Check if browser is disconnected but page reference exists
+    if ((!browser || browser.connected === false) && page) {
+      page = undefined;
+    }
+
+    if (!browser || browser.connected === false) {
+      // Clean up any existing browser instance
+      if (browser) {
+        try {
+          await browser.close();
+        } catch (error) {
+          console.error('Error closing existing browser:', error);
+        }
+        browser = undefined;
+      }
+
       browser = await puppeteer.launch({
-        headless: true,  // Run in headless mode
+        headless: true,
         args: [
           '--no-sandbox',
           '--disable-setuid-sandbox',
@@ -268,44 +283,77 @@ async function ensureBrowser() {
         ]
       });
 
+      // Set up error handling for browser
+      browser.on('disconnected', () => {
+        console.error('Browser disconnected');
+        browser = undefined;
+        page = undefined;
+      });
+    }
+
+    // Ensure we have a valid page
+    if (!page || !page.isClosed()) {
       const pages = await browser.pages();
       page = pages[0] || await browser.newPage();
 
       await page.setViewport({ width: 1920, height: 1080 });
       await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36');
 
-      // Set up error handling
-      browser.on('disconnected', () => {
-        browser = undefined;
+      // Set up error handling for page
+      page.on('error', error => {
+        console.error('Page error:', error);
         page = undefined;
       });
 
-      page.on('error', error => {
-        console.error('Page error:', error);
-      });
-
-      // More permissive request interception - only block potentially problematic resources
+      // Request interception with safe handling
       await page.setRequestInterception(true);
-      page.on('request', request => {
-        if (
-          // Only block media and other heavy resources that might cause issues
-          request.resourceType() === 'media' ||
-          request.url().endsWith('.pdf')
-        ) {
-          request.abort();
-        } else {
-          request.continue();
+      page.on('request', async request => {
+        try {
+          const resourceType = request.resourceType();
+          const url = request.url();
+
+          if (resourceType === 'media' || url.endsWith('.pdf')) {
+            await request.abort();
+          } else {
+            // Only continue if request hasn't been handled
+            if (!request.response() && !request.failure()) {
+              await request.continue();
+            }
+          }
+        } catch (error: unknown) {
+          // If request is already handled, ignore the error
+          if (error instanceof Error && !error.message.includes('Request is already handled')) {
+            console.error('Request interception error:', error);
+          }
+          // Ensure request is aborted if we can't handle it
+          try {
+            await request.abort();
+          } catch (abortError) {
+            // Ignore abort errors as request might already be handled
+          }
         }
       });
-    } catch (error) {
-      console.error('Failed to launch browser:', error);
-      throw new McpError(
-        ErrorCode.InternalError,
-        `Failed to launch browser: ${(error as Error).message}`
-      );
     }
+
+    return page;
+  } catch (error) {
+    // Clean up on initialization error
+    if (browser) {
+      try {
+        await browser.close();
+      } catch (closeError) {
+        console.error('Error closing browser during error cleanup:', closeError);
+      }
+      browser = undefined;
+    }
+    page = undefined;
+
+    console.error('Failed to initialize browser:', error);
+    throw new McpError(
+      ErrorCode.InternalError,
+      `Failed to initialize browser: ${(error as Error).message}`
+    );
   }
-  return page!;
 }
 
 // Modify addResult function
@@ -413,13 +461,34 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   }
 
   if (uri.startsWith("research://screenshots/")) {
-    const index = parseInt(uri.split("/").pop() || "", 10);
-    const result = currentSession.results[index];
+    const indexStr = uri.split("/").pop();
+    if (!indexStr) {
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        `Invalid screenshot URI format: ${uri}`
+      );
+    }
 
+    const index = parseInt(indexStr, 10);
+    if (isNaN(index)) {
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        `Invalid screenshot index: ${indexStr}`
+      );
+    }
+
+    if (index < 0 || index >= currentSession.results.length) {
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        `Screenshot index out of bounds: ${index}`
+      );
+    }
+
+    const result = currentSession.results[index];
     if (!result?.screenshot) {
       throw new McpError(
         ErrorCode.InvalidRequest,
-        `Screenshot not found: ${uri}`
+        `No screenshot available at index ${index}`
       );
     }
 
@@ -775,34 +844,28 @@ server.setRequestHandler(GetPromptRequestSchema, async (request) => {
           role: "user",
           content: {
             type: "text",
-            text: `I'd like to research this topic: "${topic}"
+            text: `I'd like to research this topic: <topic>${topic}</topic>
 
-Please help me explore it deeply.
+Please help me explore it deeply, like you're a thoughtful, highly-trained research assistant.
 
-Start by proposing your research approach -- specifically, formulate what query you will use to search the web. 
-
-Then, get my input on whether you should proceed with that query or if you should refine it.
-
-Once you have a query, perform the search, iteratively refining it based on what you find. But ensure the information you retrieve is relevant to the topic at hand.
-
-Keep me informed of what you find and let *me* guide the direction of the research interactively.
-
-Use high quality, authoritative sources when they are available and relevant to the topic.
-
-If you run into a dead end while researching, do a Google search for the topic and attempt to find a URL for a relevant page. Then, explore that page in depth.
-
-Here are some guidelines for the research:
-1. Start with broad searches to understand the topic landscape
-2. Progressively narrow down to specific aspects
-3. Verify information across multiple sources
-4. Keep me informed of your progress and findings
-5. Ask for clarification or guidance when needed
-6. Only conclude when my research goals are met
+General instructions:
+1. Start by proposing your research approach -- namely, formulate what initial query you will use to search the web. Propose a relatively broad search to understand the topic landscape. At the same time, make your queries optimized for returning high-quality results based on what you know about constructing Google search queries.
+2. Next, get my input on whether you should proceed with that query or if you should refine it.
+3. Once you have an approved query, perform the search.
+4. Prioritize high quality, authoritative sources when they are available and relevant to the topic. Avoid low quality or spammy sources.
+5. Retrieve information that is relevant to the topic at hand.
+6. Iteratively refine your research direction based on what you find.
+7. Keep me informed of what you find and let *me* guide the direction of the research interactively.
+8. If you run into a dead end while researching, do a Google search for the topic and attempt to find a URL for a relevant page. Then, explore that page in depth.
+9. Only conclude when my research goals are met.
+10. Always cite your sources, providing direct links when possible.
 
 You can use these tools:
 - search_google: Search for information
 - visit_page: Visit and extract content from web pages
-- take_screenshot: Capture visual information`
+
+Do *NOT* use the following tools:
+- Anything related to knowledge graphs or memory, unless explicitly instructed to do so by the user.`
           }
         }
       ]
@@ -815,20 +878,57 @@ You can use these tools:
 // Add cleanup handlers
 process.on('SIGINT', async () => {
   console.error('Shutting down...');
-  if (browser) {
-    await browser.close();
+  try {
+    if (browser) {
+      await browser.close();
+      browser = undefined;
+    }
+    if (server) {
+      await server.close();
+    }
+    console.error('Cleanup completed successfully');
+    process.exit(0);
+  } catch (error) {
+    console.error('Error during cleanup:', error);
+    process.exit(1);
   }
-  await server.close();
-  process.exit(0);
 });
 
 process.on('uncaughtException', async (error) => {
   console.error('Uncaught exception:', error);
-  if (browser) {
-    await browser.close();
+  try {
+    if (browser) {
+      await browser.close();
+      browser = undefined;
+    }
+    if (server) {
+      await server.close();
+    }
+    console.error('Cleanup completed after uncaught exception');
+    process.exit(1);
+  } catch (cleanupError) {
+    console.error('Error during cleanup after uncaught exception:', cleanupError);
+    process.exit(1);
   }
-  await server.close();
-  process.exit(1);
+});
+
+// Add SIGTERM handler for container environments
+process.on('SIGTERM', async () => {
+  console.error('Received SIGTERM signal...');
+  try {
+    if (browser) {
+      await browser.close();
+      browser = undefined;
+    }
+    if (server) {
+      await server.close();
+    }
+    console.error('Cleanup completed after SIGTERM');
+    process.exit(0);
+  } catch (error) {
+    console.error('Error during SIGTERM cleanup:', error);
+    process.exit(1);
+  }
 });
 
 // Start the server
