@@ -256,6 +256,8 @@ async function ensureBrowser() {
   try {
     // Check if browser is disconnected but page reference exists
     if ((!browser || browser.connected === false) && page) {
+      // Clean up listeners before destroying page
+      await page.removeAllListeners();
       page = undefined;
     }
 
@@ -284,15 +286,18 @@ async function ensureBrowser() {
       });
 
       // Set up error handling for browser
-      browser.on('disconnected', () => {
+      browser.on('disconnected', async () => {
         console.error('Browser disconnected');
+        if (page) {
+          await page.removeAllListeners();
+        }
         browser = undefined;
         page = undefined;
       });
     }
 
     // Ensure we have a valid page
-    if (!page || !page.isClosed()) {
+    if (!page || page.isClosed()) {
       const pages = await browser.pages();
       page = pages[0] || await browser.newPage();
 
@@ -321,15 +326,25 @@ async function ensureBrowser() {
             }
           }
         } catch (error: unknown) {
-          // If request is already handled, ignore the error
-          if (error instanceof Error && !error.message.includes('Request is already handled')) {
+          // Check if request is already handled
+          const isAlreadyHandledError =
+            error instanceof Error &&
+            (error.message.includes('Request is already handled') ||
+              error.message.includes('Request Interception is not enabled'));
+
+          if (!isAlreadyHandledError) {
             console.error('Request interception error:', error);
           }
-          // Ensure request is aborted if we can't handle it
-          try {
-            await request.abort();
-          } catch (abortError) {
-            // Ignore abort errors as request might already be handled
+
+          // Only try to abort if it's not an "already handled" error
+          if (!isAlreadyHandledError) {
+            try {
+              await request.abort();
+            } catch (abortError) {
+              if (!(abortError instanceof Error && abortError.message.includes('Request is already handled'))) {
+                console.error('Failed to abort request:', abortError);
+              }
+            }
           }
         }
       });
@@ -373,7 +388,11 @@ function addResult(result: ResearchResult) {
 
   // Remove oldest result if we hit the limit
   if (currentSession.results.length >= MAX_RESULTS_PER_SESSION) {
-    currentSession.results.shift();
+    const removedResult = currentSession.results.shift();
+    // Clean up screenshot data
+    if (removedResult?.screenshot) {
+      removedResult.screenshot = undefined;
+    }
   }
 
   currentSession.results.push(result);
@@ -592,6 +611,16 @@ type ToolResult = {
   isError?: boolean;
 };
 
+// Add URL validation helper
+function isValidUrl(urlString: string): boolean {
+  try {
+    const url = new URL(urlString);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 // Update handler to use type alias
 server.setRequestHandler(CallToolRequestSchema, async (request): Promise<ToolResult> => {
   const page = await ensureBrowser();
@@ -704,6 +733,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<ToolRes
 
     case "visit_page": {
       const { url, takeScreenshot } = request.params.arguments as { url: string; takeScreenshot?: boolean };
+
+      // Validate URL before proceeding
+      if (!isValidUrl(url)) {
+        return {
+          content: [{
+            type: "text",
+            text: `Invalid URL: ${url}. Only http and https protocols are supported.`
+          }],
+          isError: true
+        };
+      }
 
       try {
         const result = await withRetry(async () => {
@@ -875,21 +915,67 @@ Do *NOT* use the following tools:
   throw new McpError(ErrorCode.InvalidRequest, "Prompt implementation not found");
 });
 
-// Add cleanup handlers
+// Add cleanup timeout constant
+const CLEANUP_TIMEOUT_MS = 5000;
+
+// Helper function for cleanup with timeout
+async function cleanupWithTimeout() {
+  return Promise.race([
+    (async () => {
+      if (browser) {
+        try {
+          await browser.close();
+        } catch (error) {
+          console.error('Error closing browser:', error);
+        }
+        browser = undefined;
+      }
+      if (server) {
+        await server.close();
+      }
+    })(),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('Cleanup timeout')), CLEANUP_TIMEOUT_MS)
+    )
+  ]).catch(error => {
+    console.error('Cleanup failed:', error);
+    // Force process exit after timeout
+    process.exit(1);
+  });
+}
+
+async function cleanupBrowser() {
+  if (browser) {
+    try {
+      if (page) {
+        await page.removeAllListeners();
+        await page.close().catch(console.error);
+      }
+      await browser.close().catch(console.error);
+    } catch (error) {
+      console.error('Error during browser cleanup:', error);
+    } finally {
+      browser = undefined;
+      page = undefined;
+    }
+  }
+}
+
+// Update process handlers with proper error handling
 process.on('SIGINT', async () => {
   console.error('Shutting down...');
+  await cleanupBrowser();
+  await cleanupWithTimeout();
+  process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+  console.error('Received SIGTERM signal...');
   try {
-    if (browser) {
-      await browser.close();
-      browser = undefined;
-    }
-    if (server) {
-      await server.close();
-    }
-    console.error('Cleanup completed successfully');
+    await cleanupWithTimeout();
     process.exit(0);
   } catch (error) {
-    console.error('Error during cleanup:', error);
+    console.error('Fatal error during SIGTERM cleanup:', error);
     process.exit(1);
   }
 });
@@ -897,36 +983,10 @@ process.on('SIGINT', async () => {
 process.on('uncaughtException', async (error) => {
   console.error('Uncaught exception:', error);
   try {
-    if (browser) {
-      await browser.close();
-      browser = undefined;
-    }
-    if (server) {
-      await server.close();
-    }
-    console.error('Cleanup completed after uncaught exception');
+    await cleanupWithTimeout();
     process.exit(1);
   } catch (cleanupError) {
-    console.error('Error during cleanup after uncaught exception:', cleanupError);
-    process.exit(1);
-  }
-});
-
-// Add SIGTERM handler for container environments
-process.on('SIGTERM', async () => {
-  console.error('Received SIGTERM signal...');
-  try {
-    if (browser) {
-      await browser.close();
-      browser = undefined;
-    }
-    if (server) {
-      await server.close();
-    }
-    console.error('Cleanup completed after SIGTERM');
-    process.exit(0);
-  } catch (error) {
-    console.error('Error during SIGTERM cleanup:', error);
+    console.error('Fatal error during uncaught exception cleanup:', cleanupError);
     process.exit(1);
   }
 });
@@ -938,16 +998,44 @@ server.connect(transport).catch((error) => {
   process.exit(1);
 });
 
+// Add screenshot constraints
+const MAX_SCREENSHOT_DIMENSION = 10000; // 10k pixels max dimension
+const MIN_SCREENSHOT_DIMENSION = 100;    // 100 pixels min dimension
+
 async function takeScreenshotWithSizeLimit(
   page: Page,
   maxSizeBytes: number = 500000
 ): Promise<string> {
+  let sharpInstance: sharp.Sharp | undefined;
   try {
+    // Get page dimensions first
+    const dimensions = await page.evaluate(() => ({
+      width: Math.min(document.documentElement.scrollWidth, MAX_SCREENSHOT_DIMENSION),
+      height: Math.min(document.documentElement.scrollHeight, MAX_SCREENSHOT_DIMENSION)
+    }));
+
+    // Validate dimensions
+    if (dimensions.width < MIN_SCREENSHOT_DIMENSION || dimensions.height < MIN_SCREENSHOT_DIMENSION) {
+      throw new Error('Page dimensions too small for screenshot');
+    }
+
+    // Set viewport to capped dimensions
+    await page.setViewport({
+      width: dimensions.width,
+      height: dimensions.height
+    });
+
     // Take screenshot directly as base64
     const screenshot = await page.screenshot({
       type: 'png',
       encoding: 'base64',
-      fullPage: true
+      fullPage: true,
+      clip: {
+        x: 0,
+        y: 0,
+        width: dimensions.width,
+        height: dimensions.height
+      }
     });
 
     if (typeof screenshot !== 'string') {
@@ -963,61 +1051,77 @@ async function takeScreenshotWithSizeLimit(
       return screenshot;
     }
 
-    // Convert base64 back to buffer for resizing
+    // Convert base64 to buffer for resizing
     const buffer = Buffer.from(screenshot, 'base64');
 
-    // Get original dimensions
-    const metadata = await sharp(buffer).metadata();
-    const originalWidth = metadata.width || 1920;
-    const originalHeight = metadata.height || 1080;
-    console.error(`Original dimensions: ${originalWidth}x${originalHeight}`);
+    try {
+      // Create Sharp instance
+      sharpInstance = sharp(buffer);
 
-    // Calculate initial scale based on target size
-    let scale = Math.sqrt(maxSizeBytes / approximateBytes) * 0.8;
-    let attempts = 0;
-    const maxAttempts = 5;
+      // Get original dimensions
+      const metadata = await sharpInstance.metadata();
+      const originalWidth = metadata.width || dimensions.width;
+      const originalHeight = metadata.height || dimensions.height;
+      console.error(`Original dimensions: ${originalWidth}x${originalHeight}`);
 
-    while (attempts < maxAttempts) {
-      const newWidth = Math.floor(originalWidth * scale);
-      const newHeight = Math.floor(originalHeight * scale);
-      console.error(`Attempt ${attempts + 1}: Resizing to ${newWidth}x${newHeight} (scale: ${scale.toFixed(2)})`);
+      // Calculate initial scale based on target size
+      let scale = Math.sqrt(maxSizeBytes / approximateBytes) * 0.8;
+      let attempts = 0;
+      const maxAttempts = 5;
 
-      const resized = await sharp(buffer)
-        .resize(newWidth, newHeight, {
-          fit: 'inside',
-          withoutEnlargement: true
-        })
-        .png({
-          compressionLevel: 9,
-          quality: 40,
-          effort: 10
-        })
-        .toBuffer();
+      while (attempts < maxAttempts) {
+        const newWidth = Math.max(MIN_SCREENSHOT_DIMENSION, Math.floor(originalWidth * scale));
+        const newHeight = Math.max(MIN_SCREENSHOT_DIMENSION, Math.floor(originalHeight * scale));
+        console.error(`Attempt ${attempts + 1}: Resizing to ${newWidth}x${newHeight} (scale: ${scale.toFixed(2)})`);
 
-      console.error(`Resized image size: ${resized.length} bytes`);
+        // Create new Sharp instance for each attempt
+        const resizeInstance = sharp(buffer)
+          .resize(newWidth, newHeight, {
+            fit: 'inside',
+            withoutEnlargement: true
+          })
+          .png({
+            compressionLevel: 9,
+            quality: 40,
+            effort: 10
+          });
 
-      if (resized.length <= maxSizeBytes) {
-        return resized.toString('base64');
+        const resized = await resizeInstance.toBuffer();
+        console.error(`Resized image size: ${resized.length} bytes`);
+
+        if (resized.length <= maxSizeBytes) {
+          return resized.toString('base64');
+        }
+
+        scale *= 0.7;
+        attempts++;
       }
 
-      scale *= 0.7;
-      attempts++;
+      // Final attempt with most aggressive compression
+      const finalInstance = sharp(buffer)
+        .resize(
+          Math.max(MIN_SCREENSHOT_DIMENSION, 640),
+          Math.max(MIN_SCREENSHOT_DIMENSION, 480),
+          {
+            fit: 'inside',
+            withoutEnlargement: true
+          }
+        )
+        .png({
+          compressionLevel: 9,
+          quality: 20,
+          effort: 10
+        });
+
+      const finalAttempt = await finalInstance.toBuffer();
+      return finalAttempt.toString('base64');
+
+    } finally {
+      // Clean up Sharp instances
+      if (sharpInstance) {
+        await sharpInstance.destroy();
+      }
     }
-
-    // Final attempt with most aggressive compression
-    const finalAttempt = await sharp(buffer)
-      .resize(640, 480, {
-        fit: 'inside',
-        withoutEnlargement: true
-      })
-      .png({
-        compressionLevel: 9,
-        quality: 20,
-        effort: 10
-      })
-      .toBuffer();
-
-    return finalAttempt.toString('base64');
 
   } catch (error) {
     console.error('Screenshot error:', error);
