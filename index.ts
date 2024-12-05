@@ -150,6 +150,10 @@ const MAX_CONTENT_LENGTH = 100000;    // Maximum content length (100KB) per resu
 const MAX_RETRIES = 3;                // Maximum retry attempts for operations
 const RETRY_DELAY = 1000;             // Delay between retries in milliseconds
 
+// Screenshot dimension constraints to ensure reasonable image sizes
+const MAX_SCREENSHOT_DIMENSION = 10000;  // Maximum allowed width/height in pixels
+const MIN_SCREENSHOT_DIMENSION = 100;    // Minimum allowed width/height in pixels
+
 // Generic retry mechanism for handling transient failures
 async function withRetry<T>(
     operation: () => Promise<T>,  // Operation to retry
@@ -302,10 +306,6 @@ async function safePageNavigation(page: Page, url: string): Promise<void> {
     }
 }
 
-// Screenshot dimension constraints to ensure reasonable image sizes
-const MAX_SCREENSHOT_DIMENSION = 10000;  // Maximum allowed width/height in pixels
-const MIN_SCREENSHOT_DIMENSION = 100;    // Minimum allowed width/height in pixels
-
 // Take and optimize a screenshot with size constraints
 async function takeScreenshotWithSizeLimit(
     page: Page,                    // Puppeteer page to screenshot
@@ -316,10 +316,10 @@ async function takeScreenshotWithSizeLimit(
 
     try {
         // Step 1: Get page dimensions while respecting maximum limits
-        const dimensions = await page.evaluate(() => ({
-            width: Math.min(document.documentElement.scrollWidth, MAX_SCREENSHOT_DIMENSION),
-            height: Math.min(document.documentElement.scrollHeight, MAX_SCREENSHOT_DIMENSION)
-        }));
+        const dimensions = await page.evaluate((maxDimension) => ({
+            width: Math.min(document.documentElement.scrollWidth, maxDimension),
+            height: Math.min(document.documentElement.scrollHeight, maxDimension)
+        }), MAX_SCREENSHOT_DIMENSION);
 
         // Step 2: Validate minimum dimensions
         if (dimensions.width < MIN_SCREENSHOT_DIMENSION || dimensions.height < MIN_SCREENSHOT_DIMENSION) {
@@ -336,13 +336,7 @@ async function takeScreenshotWithSizeLimit(
         const screenshot = await page.screenshot({
             type: 'png',         // Use PNG for better quality
             encoding: 'base64',  // Get result as base64 string
-            fullPage: true,      // Capture entire page
-            clip: {              // Ensure exact dimensions
-                x: 0,
-                y: 0,
-                width: dimensions.width,
-                height: dimensions.height
-            }
+            fullPage: true       // Capture entire page
         });
 
         // Step 5: Validate screenshot data
@@ -412,8 +406,8 @@ async function takeScreenshotWithSizeLimit(
             // Step 9: Final fallback to minimum size
             const finalInstance = sharp(buffer)
                 .resize(
-                    Math.max(MIN_SCREENSHOT_DIMENSION, 640),    // Minimum width with 640px floor
-                    Math.max(MIN_SCREENSHOT_DIMENSION, 480),    // Minimum height with 480px floor
+                    Math.max(MIN_SCREENSHOT_DIMENSION, 640),  // Minimum width with 640px floor
+                    Math.max(MIN_SCREENSHOT_DIMENSION, 480),  // Minimum height with 480px floor
                     {
                         fit: 'inside',
                         withoutEnlargement: true
@@ -510,25 +504,23 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
             contents: [{
                 uri,
                 mimeType: "application/json",
-                // Format session data as JSON with relevant metadata
                 text: JSON.stringify({
                     query: currentSession.query,
                     resultCount: currentSession.results.length,
                     lastUpdated: currentSession.lastUpdated,
-                    // Include basic result information without full content
                     results: currentSession.results.map(r => ({
                         title: r.title,
                         url: r.url,
                         timestamp: r.timestamp
                     }))
-                }, null, 2)  // Pretty print with 2-space indentation
+                }, null, 2)
             }]
         };
     }
 
     // Handle screenshot requests
-    if (uri.startsWith("screenshot://")) {
-        const index = parseInt(uri.split("://")[1], 10);
+    if (uri.startsWith("research://screenshots/")) {
+        const index = parseInt(uri.split("/").pop() || "", 10);
 
         // Verify session exists
         if (!currentSession) {
@@ -539,7 +531,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
         }
 
         // Verify index is within bounds
-        if (index < 0 || index >= currentSession.results.length) {
+        if (isNaN(index) || index < 0 || index >= currentSession.results.length) {
             throw new McpError(
                 ErrorCode.InvalidRequest,
                 `Screenshot index out of bounds: ${index}`
