@@ -9,17 +9,17 @@ import {
   ReadResourceRequestSchema,
   ListPromptsRequestSchema,
   GetPromptRequestSchema,
-  CallToolResult,
-  TextContent,
-  ImageContent,
   Tool,
   Resource,
   McpError,
   ErrorCode,
+  TextContent,
+  ImageContent,
 } from "@modelcontextprotocol/sdk/types.js";
 import puppeteer, { Browser, Page } from "puppeteer";
 import TurndownService from "turndown";
 import type { Node } from "turndown";
+import sharp from 'sharp';
 
 // Initialize turndown with custom options
 const turndownService = new TurndownService({
@@ -98,24 +98,11 @@ const TOOLS: Tool[] = [
     },
   },
   {
-    name: "extract_content",
-    description: "Extract specific content from the current page using CSS selectors",
-    inputSchema: {
-      type: "object",
-      properties: {
-        selector: { type: "string", description: "CSS selector to extract content from" },
-      },
-      required: ["selector"],
-    },
-  },
-  {
     name: "take_screenshot",
-    description: "Take a screenshot of the current page or a specific element",
+    description: "Take a screenshot of the current page",
     inputSchema: {
       type: "object",
-      properties: {
-        selector: { type: "string", description: "CSS selector for element to screenshot" },
-      },
+      properties: {},  // No parameters needed
     },
   },
 ];
@@ -128,10 +115,6 @@ interface AgenticResearchArgs {
   topic: string;
   depth?: ResearchDepth;
 }
-
-type PromptArgs = {
-  "agentic-research": AgenticResearchArgs;
-};
 
 // Define prompts with proper typing
 const PROMPTS = {
@@ -158,26 +141,143 @@ let browser: Browser | undefined;
 let page: Page | undefined;
 let currentSession: ResearchSession | undefined;
 
+// Add at the top with other constants
+const MAX_RESULTS_PER_SESSION = 100;
+const MAX_CONTENT_LENGTH = 100000; // 100KB limit for content
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 1000; // 1 second
+
+// Add utility functions for retry logic and error handling
+async function withRetry<T>(
+  operation: () => Promise<T>,
+  retries = MAX_RETRIES,
+  delay = RETRY_DELAY
+): Promise<T> {
+  let lastError: Error;
+
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error as Error;
+      if (i < retries - 1) {
+        console.error(`Attempt ${i + 1} failed, retrying in ${delay}ms:`, error);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  }
+
+  throw lastError!;
+}
+
+// Enhanced error handling for navigation
+async function safePageNavigation(page: Page, url: string): Promise<void> {
+  try {
+    // First try with just domcontentloaded - faster and more permissive
+    const response = await page.goto(url, {
+      waitUntil: ['domcontentloaded'],
+      timeout: 15000 // Reduced timeout
+    });
+
+    if (!response) {
+      console.warn('Navigation resulted in no response, but continuing anyway');
+    } else {
+      const status = response.status();
+      if (status >= 400) {
+        throw new Error(`HTTP ${status}: ${response.statusText()}`);
+      }
+    }
+
+    // Wait for body with a short timeout
+    try {
+      await page.waitForSelector('body', { timeout: 3000 });
+    } catch (error) {
+      console.warn('Body selector timeout, but continuing anyway');
+    }
+
+    // Minimal delay to let the most critical elements load
+    await new Promise(resolve => setTimeout(resolve, 500));
+
+    // Check for bot protection pages and empty content
+    const pageContent = await page.evaluate(() => {
+      // Only check for actual bot protection elements/classes
+      const botProtectionSelectors = [
+        '#challenge-running',     // Cloudflare
+        '#cf-challenge-running',  // Cloudflare
+        '#px-captcha',            // PerimeterX
+        '#ddos-protection',       // Various
+        '#waf-challenge-html'     // Various WAFs
+      ];
+
+      // Check for actual bot protection elements
+      const hasBotProtection = botProtectionSelectors.some(selector =>
+        document.querySelector(selector) !== null
+      );
+
+      // Get meaningful text content (excluding scripts, styles, etc.)
+      const meaningfulText = Array.from(document.body.getElementsByTagName('*'))
+        .map(element => {
+          if (element.tagName === 'SCRIPT' || element.tagName === 'STYLE' || element.tagName === 'NOSCRIPT') {
+            return '';
+          }
+          return element.textContent || '';
+        })
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      return {
+        hasBotProtection,
+        meaningfulText,
+        title: document.title
+      };
+    });
+
+    if (pageContent.hasBotProtection) {
+      throw new Error('Bot protection detected (Cloudflare or similar service)');
+    }
+
+    // Check for empty or meaningless content
+    if (!pageContent.meaningfulText || pageContent.meaningfulText.length < 1000) {
+      throw new Error('Page appears to be empty or has no meaningful content');
+    }
+
+    // Additional check for suspicious titles that might indicate bot protection
+    const suspiciousTitles = ['security check', 'ddos protection', 'please wait', 'just a moment', 'attention required'];
+    if (suspiciousTitles.some(title => pageContent.title.toLowerCase().includes(title))) {
+      throw new Error('Suspicious page title indicates possible bot protection');
+    }
+
+  } catch (error) {
+    // If the error is a timeout, we'll still try to proceed
+    if ((error as Error).message.includes('timeout')) {
+      console.warn('Navigation timeout, but continuing with available content');
+      return;
+    }
+    throw new Error(`Navigation failed: ${(error as Error).message}`);
+  }
+}
+
 // Helper function to ensure browser is running
 async function ensureBrowser() {
   if (!browser) {
     try {
       browser = await puppeteer.launch({
-        headless: true,
+        headless: true,  // Run in headless mode
         args: [
           '--no-sandbox',
           '--disable-setuid-sandbox',
           '--disable-dev-shm-usage',
-          '--disable-accelerated-2d-canvas',
           '--disable-gpu',
-          '--window-size=1920,1080'
+          '--window-size=1920,1080',
+          '--hide-scrollbars',
+          '--mute-audio'
         ]
       });
 
       const pages = await browser.pages();
       page = pages[0] || await browser.newPage();
 
-      // Set viewport and user agent
       await page.setViewport({ width: 1920, height: 1080 });
       await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36');
 
@@ -191,13 +291,13 @@ async function ensureBrowser() {
         console.error('Page error:', error);
       });
 
-      // Add request interception for better performance
+      // More permissive request interception - only block potentially problematic resources
       await page.setRequestInterception(true);
       page.on('request', request => {
         if (
-          request.resourceType() === 'image' ||
-          request.resourceType() === 'font' ||
-          request.resourceType() === 'media'
+          // Only block media and other heavy resources that might cause issues
+          request.resourceType() === 'media' ||
+          request.url().endsWith('.pdf')
         ) {
           request.abort();
         } else {
@@ -215,7 +315,7 @@ async function ensureBrowser() {
   return page!;
 }
 
-// Helper function to add a result to the current session
+// Modify addResult function
 function addResult(result: ResearchResult) {
   if (!currentSession) {
     currentSession = {
@@ -223,6 +323,16 @@ function addResult(result: ResearchResult) {
       results: [],
       lastUpdated: new Date().toISOString(),
     };
+  }
+
+  // Trim content if it exceeds limit
+  if (result.content && result.content.length > MAX_CONTENT_LENGTH) {
+    result.content = result.content.substring(0, MAX_CONTENT_LENGTH) + '... (content truncated)';
+  }
+
+  // Remove oldest result if we hit the limit
+  if (currentSession.results.length >= MAX_RESULTS_PER_SESSION) {
+    currentSession.results.shift();
   }
 
   currentSession.results.push(result);
@@ -237,48 +347,95 @@ function addResult(result: ResearchResult) {
 // Create server instance
 const server = new Server(
   {
-    name: "web-research-server",
+    name: "webresearch",
     version: "0.1.0",
   },
   {
     capabilities: {
-      resources: {},
       tools: {},
-      prompts: {},
+      resources: {},
+      prompts: {}
     },
   }
 );
 
-// Set up request handlers
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return { tools: TOOLS };
-});
+// Register tool handlers
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: TOOLS
+}));
 
+// Register resource handlers
 server.setRequestHandler(ListResourcesRequestSchema, async () => {
-  const resources: Resource[] = [];
-
-  if (currentSession) {
-    resources.push({
-      uri: `research://${encodeURIComponent(currentSession.query)}`,
-      name: `Research: ${currentSession.query}`,
-      description: `Research session with ${currentSession.results.length} results`,
-      mimeType: "application/json",
-    });
+  if (!currentSession) {
+    return { resources: [] };
   }
+
+  const resources: Resource[] = [
+    {
+      uri: "research://current/summary",
+      name: "Current Research Session Summary",
+      description: "Summary of the current research session including queries and results",
+      mimeType: "application/json"
+    },
+    ...currentSession.results
+      .filter(r => r.screenshot)
+      .map((r, i) => ({
+        uri: `research://screenshots/${i}`,
+        name: `Screenshot of ${r.title}`,
+        description: `Screenshot taken from ${r.url}`,
+        mimeType: "image/png"
+      }))
+  ];
 
   return { resources };
 });
 
 server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+  if (!currentSession) {
+    throw new McpError(
+      ErrorCode.InvalidRequest,
+      "No active research session"
+    );
+  }
+
   const uri = request.params.uri;
 
-  if (uri.startsWith("research://") && currentSession) {
+  if (uri === "research://current/summary") {
     return {
       contents: [{
         uri,
         mimeType: "application/json",
-        text: JSON.stringify(currentSession, null, 2),
-      }],
+        text: JSON.stringify({
+          query: currentSession.query,
+          resultCount: currentSession.results.length,
+          lastUpdated: currentSession.lastUpdated,
+          results: currentSession.results.map(r => ({
+            title: r.title,
+            url: r.url,
+            timestamp: r.timestamp
+          }))
+        }, null, 2)
+      }]
+    };
+  }
+
+  if (uri.startsWith("research://screenshots/")) {
+    const index = parseInt(uri.split("/").pop() || "", 10);
+    const result = currentSession.results[index];
+
+    if (!result?.screenshot) {
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        `Screenshot not found: ${uri}`
+      );
+    }
+
+    return {
+      contents: [{
+        uri,
+        mimeType: "image/png",
+        blob: result.screenshot
+      }]
     };
   }
 
@@ -367,74 +524,119 @@ async function extractContentAsMarkdown(page: Page, selector?: string): Promise<
   }
 }
 
-// Handle tool calls
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+// Update the type alias at the top of the file
+type ToolResult = {
+  content: (TextContent | ImageContent)[];
+  isError?: boolean;
+};
+
+// Update handler to use type alias
+server.setRequestHandler(CallToolRequestSchema, async (request): Promise<ToolResult> => {
   const page = await ensureBrowser();
 
   switch (request.params.name) {
     case "search_google": {
       const { query } = request.params.arguments as { query: string };
 
-      // Update current session
-      currentSession = {
-        query,
-        results: [],
-        lastUpdated: new Date().toISOString(),
-      };
-
       try {
-        // Navigate to Google and perform search
-        await page.goto('https://www.google.com', { waitUntil: 'networkidle0' });
-        await page.waitForSelector('input[name="q"]', { timeout: 5000 });
-        await page.type('input[name="q"]', query);
-        await Promise.all([
-          page.waitForNavigation({ waitUntil: 'networkidle0' }),
-          page.keyboard.press('Enter'),
-        ]);
+        const results = await withRetry(async () => {
+          await safePageNavigation(page, 'https://www.google.com');
 
-        // Extract search results
-        const searchResults = await page.evaluate(() => {
-          const results: { title: string; url: string; snippet: string; }[] = [];
-          const elements = document.querySelectorAll('div.g');
+          // Wait for and find search input with multiple strategies
+          await withRetry(async () => {
+            // Wait for any of the possible search input selectors
+            await Promise.race([
+              page.waitForSelector('input[name="q"]', { timeout: 5000 }),
+              page.waitForSelector('textarea[name="q"]', { timeout: 5000 }),
+              page.waitForSelector('input[type="text"]', { timeout: 5000 })
+            ]).catch(() => {
+              throw new Error('Search input not found - no matching selectors');
+            });
 
-          elements.forEach((el) => {
-            const titleEl = el.querySelector('h3');
-            const linkEl = el.querySelector('a');
-            const snippetEl = el.querySelector('div.VwiC3b');
+            // Try different selector strategies
+            const searchInput = await page.$('input[name="q"]') ||
+              await page.$('textarea[name="q"]') ||
+              await page.$('input[type="text"]');
 
-            if (titleEl && linkEl && snippetEl) {
-              results.push({
-                title: titleEl.textContent || '',
-                url: linkEl.getAttribute('href') || '',
-                snippet: snippetEl.textContent || '',
-              });
+            if (!searchInput) {
+              throw new Error('Search input element not found after waiting');
             }
+
+            // Clear any existing text and type the query
+            await searchInput.click({ clickCount: 3 }); // Select all existing text
+            await searchInput.press('Backspace'); // Clear the selection
+            await searchInput.type(query);
+          }, 3, 2000); // 3 retries, 2 second delay
+
+          // Perform search with retry
+          await withRetry(async () => {
+            await Promise.all([
+              page.keyboard.press('Enter'),
+              page.waitForNavigation({
+                waitUntil: ['load', 'networkidle0'],
+                timeout: 30000
+              })
+            ]);
           });
 
-          return results;
-        });
+          // Extract results with retry
+          const searchResults = await withRetry(async () => {
+            const results = await page.evaluate(() => {
+              const elements = document.querySelectorAll('div.g');
+              if (!elements || elements.length === 0) {
+                throw new Error('No search results found');
+              }
 
-        // Add results to session
-        searchResults.forEach((result) => {
-          addResult({
-            url: result.url,
-            title: result.title,
-            content: result.snippet,
-            timestamp: new Date().toISOString(),
+              return Array.from(elements).map((el) => {
+                const titleEl = el.querySelector('h3');
+                const linkEl = el.querySelector('a');
+                const snippetEl = el.querySelector('div.VwiC3b');
+
+                if (!titleEl || !linkEl || !snippetEl) {
+                  return null;
+                }
+
+                return {
+                  title: titleEl.textContent || '',
+                  url: linkEl.getAttribute('href') || '',
+                  snippet: snippetEl.textContent || '',
+                };
+              }).filter(result => result !== null);
+            });
+
+            if (!results || results.length === 0) {
+              throw new Error('No valid search results found');
+            }
+
+            return results;
           });
+
+          searchResults.forEach((result) => {
+            addResult({
+              url: result.url,
+              title: result.title,
+              content: result.snippet,
+              timestamp: new Date().toISOString(),
+            });
+          });
+
+          return searchResults;
         });
 
         return {
           content: [{
             type: "text",
-            text: JSON.stringify(searchResults, null, 2),
-          }],
+            text: JSON.stringify(results, null, 2)
+          }]
         };
       } catch (error) {
-        throw new McpError(
-          ErrorCode.InternalError,
-          `Failed to perform search: ${(error as Error).message}`
-        );
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to perform search: ${(error as Error).message}`
+          }],
+          isError: true
+        };
       }
     }
 
@@ -442,134 +644,104 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { url, takeScreenshot } = request.params.arguments as { url: string; takeScreenshot?: boolean };
 
       try {
-        await page.goto(url, {
-          waitUntil: 'networkidle0',
-          timeout: 30000
-        });
-        const title = await page.title();
+        const result = await withRetry(async () => {
+          await safePageNavigation(page, url);
+          const title = await page.title();
 
-        // Extract content as markdown
-        const content = await extractContentAsMarkdown(page);
-
-        const result: ResearchResult = {
-          url,
-          title,
-          content,
-          timestamp: new Date().toISOString(),
-        };
-
-        if (takeScreenshot) {
-          const screenshot = await page.screenshot({
-            encoding: 'base64',
-            fullPage: false,
-            type: 'png',
-            quality: 80
+          const content = await withRetry(async () => {
+            const extractedContent = await extractContentAsMarkdown(page);
+            if (!extractedContent) {
+              throw new Error('Failed to extract content');
+            }
+            return extractedContent;
           });
-          result.screenshot = screenshot as string;
-        }
 
-        addResult(result);
+          const pageResult: ResearchResult = {
+            url,
+            title,
+            content,
+            timestamp: new Date().toISOString(),
+          };
 
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(result, null, 2),
-            },
-            ...(takeScreenshot ? [{
-              type: "image",
-              data: result.screenshot,
-              mimeType: "image/png",
-            } as ImageContent] : []),
-          ],
-        };
-      } catch (error) {
-        throw new McpError(
-          ErrorCode.InternalError,
-          `Failed to visit page: ${(error as Error).message}`
-        );
-      }
-    }
+          if (takeScreenshot) {
+            const screenshot = await takeScreenshotWithSizeLimit(page);
+            pageResult.screenshot = screenshot;
 
-    case "extract_content": {
-      const { selector } = request.params.arguments as { selector: string };
+            // Notify that a new screenshot resource is available
+            server.notification({
+              method: "notifications/resources/list_changed"
+            });
+          }
 
-      try {
-        await page.waitForSelector(selector, { timeout: 5000 });
-        const content = await extractContentAsMarkdown(page, selector);
-
-        const result: ResearchResult = {
-          url: page.url(),
-          title: await page.title(),
-          content,
-          timestamp: new Date().toISOString(),
-        };
-
-        addResult(result);
+          addResult(pageResult);
+          return pageResult;
+        });
 
         return {
           content: [{
             type: "text",
-            text: JSON.stringify(result, null, 2),
-          }],
+            text: JSON.stringify({
+              ...result,
+              screenshot: result.screenshot ? "Screenshot taken and available as a resource" : undefined
+            }, null, 2)
+          }]
         };
       } catch (error) {
-        throw new McpError(
-          ErrorCode.InternalError,
-          `Failed to extract content: ${(error as Error).message}`
-        );
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to visit page: ${(error as Error).message}`
+          }],
+          isError: true
+        };
       }
     }
 
     case "take_screenshot": {
-      const { selector } = request.params.arguments as { selector?: string };
-
       try {
-        const screenshot = await (selector ?
-          (await page.$(selector))?.screenshot({
-            encoding: 'base64',
-            type: 'png',
-            quality: 80
-          }) :
-          page.screenshot({
-            encoding: 'base64',
-            fullPage: false,
-            type: 'png',
-            quality: 80
-          }));
+        const shot = await withRetry(async () => {
+          return await takeScreenshotWithSizeLimit(page);
+        });
 
-        if (!screenshot) {
-          throw new Error(selector ? `Element not found: ${selector}` : 'Screenshot failed');
+        // Add screenshot to current session results
+        if (!currentSession) {
+          currentSession = {
+            query: "Screenshot Session",
+            results: [],
+            lastUpdated: new Date().toISOString(),
+          };
         }
 
-        const result: ResearchResult = {
-          url: page.url(),
-          title: await page.title(),
-          content: selector ? `Screenshot of element: ${selector}` : 'Full page screenshot',
+        // Store the screenshot and add result
+        const pageUrl = await page.url();
+        const pageTitle = await page.title();
+        addResult({
+          url: pageUrl,
+          title: pageTitle || "Untitled Page",
+          content: "Screenshot taken",
           timestamp: new Date().toISOString(),
-          screenshot: screenshot as string,
-        };
+          screenshot: shot
+        });
 
-        addResult(result);
+        // Notify that a new screenshot resource is available
+        server.notification({
+          method: "notifications/resources/list_changed"
+        });
 
         return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(result, null, 2),
-            },
-            {
-              type: "image",
-              data: screenshot,
-              mimeType: "image/png",
-            } as ImageContent,
-          ],
+          content: [{
+            type: "text",
+            text: "Screenshot taken successfully. The screenshot is now available as a resource."
+          }]
         };
       } catch (error) {
-        throw new McpError(
-          ErrorCode.InternalError,
-          `Failed to take screenshot: ${(error as Error).message}`
-        );
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to take screenshot: ${(error as Error).message}`
+          }],
+          isError: true
+        };
       }
     }
 
@@ -616,7 +788,6 @@ server.setRequestHandler(GetPromptRequestSchema, async (request) => {
 Available tools:
 - search_google: Search for information
 - visit_page: Visit and extract content from web pages
-- extract_content: Extract specific content from pages
 - take_screenshot: Capture visual information
 
 Remember to:
@@ -645,26 +816,115 @@ Start by explaining your research approach, then begin with initial searches. Ke
   throw new McpError(ErrorCode.InvalidRequest, "Prompt implementation not found");
 });
 
-// Main function to start the server
-async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+// Add cleanup handlers
+process.on('SIGINT', async () => {
+  console.error('Shutting down...');
+  if (browser) {
+    await browser.close();
+  }
+  await server.close();
+  process.exit(0);
+});
 
-  // Cleanup on exit
-  process.on('SIGINT', async () => {
-    if (browser) {
-      await browser.close();
-    }
-    process.exit(0);
-  });
+process.on('uncaughtException', async (error) => {
+  console.error('Uncaught exception:', error);
+  if (browser) {
+    await browser.close();
+  }
+  await server.close();
+  process.exit(1);
+});
 
-  process.on('uncaughtException', async (error) => {
-    console.error('Uncaught exception:', error);
-    if (browser) {
-      await browser.close();
+// Start the server
+const transport = new StdioServerTransport();
+server.connect(transport).catch((error) => {
+  console.error("Failed to start server:", error);
+  process.exit(1);
+});
+
+async function takeScreenshotWithSizeLimit(
+  page: Page,
+  maxSizeBytes: number = 500000
+): Promise<string> {
+  try {
+    // Take screenshot directly as base64
+    const screenshot = await page.screenshot({
+      type: 'png',
+      encoding: 'base64',
+      fullPage: true
+    });
+
+    if (typeof screenshot !== 'string') {
+      throw new Error('Screenshot failed: Invalid encoding');
     }
-    process.exit(1);
-  });
+
+    // Calculate approximate byte size (base64 is ~4/3 the size of binary)
+    const approximateBytes = Math.ceil(screenshot.length * 0.75);
+    console.error(`Original screenshot size: ~${approximateBytes} bytes`);
+
+    // If already small enough, return it
+    if (approximateBytes <= maxSizeBytes) {
+      return screenshot;
+    }
+
+    // Convert base64 back to buffer for resizing
+    const buffer = Buffer.from(screenshot, 'base64');
+
+    // Get original dimensions
+    const metadata = await sharp(buffer).metadata();
+    const originalWidth = metadata.width || 1920;
+    const originalHeight = metadata.height || 1080;
+    console.error(`Original dimensions: ${originalWidth}x${originalHeight}`);
+
+    // Calculate initial scale based on target size
+    let scale = Math.sqrt(maxSizeBytes / approximateBytes) * 0.8;
+    let attempts = 0;
+    const maxAttempts = 5;
+
+    while (attempts < maxAttempts) {
+      const newWidth = Math.floor(originalWidth * scale);
+      const newHeight = Math.floor(originalHeight * scale);
+      console.error(`Attempt ${attempts + 1}: Resizing to ${newWidth}x${newHeight} (scale: ${scale.toFixed(2)})`);
+
+      const resized = await sharp(buffer)
+        .resize(newWidth, newHeight, {
+          fit: 'inside',
+          withoutEnlargement: true
+        })
+        .png({
+          compressionLevel: 9,
+          quality: 40,
+          effort: 10
+        })
+        .toBuffer();
+
+      console.error(`Resized image size: ${resized.length} bytes`);
+
+      if (resized.length <= maxSizeBytes) {
+        return resized.toString('base64');
+      }
+
+      scale *= 0.7;
+      attempts++;
+    }
+
+    // Final attempt with most aggressive compression
+    const finalAttempt = await sharp(buffer)
+      .resize(640, 480, {
+        fit: 'inside',
+        withoutEnlargement: true
+      })
+      .png({
+        compressionLevel: 9,
+        quality: 20,
+        effort: 10
+      })
+      .toBuffer();
+
+    return finalAttempt.toString('base64');
+
+  } catch (error) {
+    console.error('Screenshot error:', error);
+    throw error;
+  }
 }
-
-main().catch(console.error);
