@@ -109,11 +109,9 @@ const TOOLS: Tool[] = [
 
 // Define prompt types
 type PromptName = "agentic-research";
-type ResearchDepth = "basic" | "moderate" | "thorough";
 
 interface AgenticResearchArgs {
   topic: string;
-  depth?: ResearchDepth;
 }
 
 // Define prompts with proper typing
@@ -126,11 +124,6 @@ const PROMPTS = {
         name: "topic",
         description: "The topic or question to research",
         required: true
-      },
-      {
-        name: "depth",
-        description: "Desired depth of research (basic, moderate, thorough)",
-        required: false
       }
     ]
   }
@@ -768,45 +761,48 @@ server.setRequestHandler(GetPromptRequestSchema, async (request) => {
   if (promptName === "agentic-research") {
     const args = request.params.arguments as AgenticResearchArgs | undefined;
     const topic = args?.topic || "";
-    const depth = args?.depth || "moderate";
 
     return {
       messages: [
         {
-          role: "system",
+          role: "assistant",
           content: {
             type: "text",
-            text: `You are a thorough research assistant conducting web research. Your goal is to explore topics deeply and iteratively, maintaining a dialogue with the user throughout the process. Follow these principles:
-
-1. Start with broad searches to understand the topic landscape
-2. Progressively narrow down to specific aspects
-3. Verify information across multiple sources
-4. Keep the user informed of your progress and findings
-5. Ask for clarification or guidance when needed
-6. Only conclude the research when the user confirms their goals are met
-
-Available tools:
-- search_google: Search for information
-- visit_page: Visit and extract content from web pages
-- take_screenshot: Capture visual information
-
-Remember to:
-- Explain your research strategy
-- Share interesting findings as you discover them
-- Suggest areas for deeper exploration
-- Ask the user for feedback and preferences
-- Adapt your approach based on user responses`
+            text: "I am ready to help you with your research. I will conduct thorough web research, explore topics deeply, and maintain a dialogue with you throughout the process."
           }
         },
         {
           role: "user",
           content: {
             type: "text",
-            text: `I'd like to research this topic: ${topic}
+            text: `I'd like to research this topic: "${topic}"
 
-Please help me explore it ${depth === "thorough" ? "very thoroughly" : depth === "basic" ? "at a basic level" : "with moderate depth"}.
+Please help me explore it deeply.
 
-Start by explaining your research approach, then begin with initial searches. Keep me informed of what you find and let me guide the direction of the research.`
+Start by proposing your research approach -- specifically, formulate what query you will use to search the web. 
+
+Then, get my input on whether you should proceed with that query or if you should refine it.
+
+Once you have a query, perform the search, iteratively refining it based on what you find. But ensure the information you retrieve is relevant to the topic at hand.
+
+Keep me informed of what you find and let *me* guide the direction of the research interactively.
+
+Use high quality, authoritative sources when they are available and relevant to the topic.
+
+If you run into a dead end while researching, do a Google search for the topic and attempt to find a URL for a relevant page. Then, explore that page in depth.
+
+Here are some guidelines for the research:
+1. Start with broad searches to understand the topic landscape
+2. Progressively narrow down to specific aspects
+3. Verify information across multiple sources
+4. Keep me informed of your progress and findings
+5. Ask for clarification or guidance when needed
+6. Only conclude when my research goals are met
+
+You can use these tools:
+- search_google: Search for information
+- visit_page: Visit and extract content from web pages
+- take_screenshot: Capture visual information`
           }
         }
       ]
