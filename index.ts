@@ -32,13 +32,13 @@ const SCREENSHOTS_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-screenshots-'
 // Initialize Turndown service for converting HTML to Markdown
 // Configure with specific formatting preferences
 const turndownService: TurndownService = new TurndownService({
-    headingStyle: 'atx',          // Use # style headings
-    hr: '---',                    // Horizontal rule style
-    bulletListMarker: '-',        // List item marker
-    codeBlockStyle: 'fenced',     // Use ``` for code blocks
-    emDelimiter: '_',             // Italics style
-    strongDelimiter: '**',        // Bold style
-    linkStyle: 'inlined',         // Use inline links
+    headingStyle: 'atx',       // Use # style headings
+    hr: '---',                 // Horizontal rule style
+    bulletListMarker: '-',     // List item marker
+    codeBlockStyle: 'fenced',  // Use ``` for code blocks
+    emDelimiter: '_',          // Italics style
+    strongDelimiter: '**',     // Bold style
+    linkStyle: 'inlined',      // Use inline links
 });
 
 // Custom Turndown rules for better content extraction
