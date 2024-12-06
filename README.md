@@ -1,6 +1,8 @@
 # MCP Web Research Server
 
-A Model Context Protocol (MCP) server for web research. Bring real-time info into Claude and easily research any topic on the web.
+A Model Context Protocol (MCP) server for web research. 
+
+Bring real-time info into Claude and easily research any topic.
 
 ## Features
 
