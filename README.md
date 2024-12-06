@@ -82,6 +82,10 @@ The server maintains a research session that includes:
 - Screenshots
 - Timestamps
 
+### Suggestions
+
+For the best results, if you choose not to use the `agentic-research` prompt when doing your research, it may be helpful to suggest high-quality sources for Claude to use when researching general topics. For example, you could prompt `news today from reuters or AP` instead of `news today`.
+
 ## Problems
 
 This is very much pre-alpha code. And it is also AIGC, so expect bugs.
