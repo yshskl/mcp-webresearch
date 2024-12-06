@@ -268,40 +268,46 @@ async function safePageNavigation(page: Page, url: string): Promise<void> {
         // Brief pause for dynamic content
         await new Promise(resolve => setTimeout(resolve, 500));
 
-        // Check for bot protection and page content
-        const pageContent = await page.evaluate(() => {
-            // Common bot protection selectors
-            const botProtectionSelectors = [
-                '#challenge-running',     // Cloudflare
-                '#cf-challenge-running',  // Cloudflare
-                '#px-captcha',            // PerimeterX
-                '#ddos-protection',       // Various
-                '#waf-challenge-html'     // Various WAFs
-            ];
+        // Check for bot protection and page content with timeout
+        const CONTENT_CHECK_TIMEOUT = 5000; // 5 seconds timeout
+        const pageContent = await Promise.race([
+            page.evaluate(() => {
+                // Common bot protection selectors
+                const botProtectionSelectors = [
+                    '#challenge-running',     // Cloudflare
+                    '#cf-challenge-running',  // Cloudflare
+                    '#px-captcha',            // PerimeterX
+                    '#ddos-protection',       // Various
+                    '#waf-challenge-html'     // Various WAFs
+                ];
 
-            // Check for bot protection elements
-            const hasBotProtection = botProtectionSelectors.some(selector =>
-                document.querySelector(selector) !== null
-            );
+                // Check for bot protection elements
+                const hasBotProtection = botProtectionSelectors.some(selector =>
+                    document.querySelector(selector) !== null
+                );
 
-            // Extract meaningful text content
-            const meaningfulText = Array.from(document.body.getElementsByTagName('*'))
-                .map(element => {
-                    if (element.tagName === 'SCRIPT' || element.tagName === 'STYLE' || element.tagName === 'NOSCRIPT') {
-                        return '';
-                    }
-                    return element.textContent || '';
-                })
-                .join(' ')
-                .replace(/\s+/g, ' ')
-                .trim();
+                // Extract meaningful text content
+                const meaningfulText = Array.from(document.body.getElementsByTagName('*'))
+                    .map(element => {
+                        if (element.tagName === 'SCRIPT' || element.tagName === 'STYLE' || element.tagName === 'NOSCRIPT') {
+                            return '';
+                        }
+                        return element.textContent || '';
+                    })
+                    .join(' ')
+                    .replace(/\s+/g, ' ')
+                    .trim();
 
-            return {
-                hasBotProtection,
-                meaningfulText,
-                title: document.title
-            };
-        });
+                return {
+                    hasBotProtection,
+                    meaningfulText,
+                    title: document.title
+                };
+            }),
+            new Promise((_, reject) =>
+                setTimeout(() => reject(new Error('Content validation check timed out')), CONTENT_CHECK_TIMEOUT)
+            )
+        ]) as { hasBotProtection: boolean; meaningfulText: string; title: string };
 
         // Handle bot protection detection
         if (pageContent.hasBotProtection) {
@@ -352,6 +358,7 @@ async function takeScreenshotWithSizeLimit(page: Page): Promise<string> {
     let attempts = 0;
     const MAX_ATTEMPTS = 3;
 
+    // While screenshot is too large, reduce size
     while (buffer.length > MAX_SIZE && attempts < MAX_ATTEMPTS) {
         // Get current viewport size
         const viewport = page.viewportSize();
@@ -378,24 +385,30 @@ async function takeScreenshotWithSizeLimit(page: Page): Promise<string> {
             fullPage: false
         });
 
+        // Update buffer with new screenshot
         buffer = screenshot;
+
+        // Increment retry attempts
         attempts++;
     }
 
+    // Final attempt with minimum settings
     if (buffer.length > MAX_SIZE) {
-        // Final attempt with minimum settings
         await page.setViewportSize({
             width: MIN_DIMENSION,
             height: MIN_DIMENSION
         });
 
+        // Take final screenshot
         screenshot = await page.screenshot({
             type: 'png',
             fullPage: false
         });
 
+        // Update buffer with final screenshot
         buffer = screenshot;
 
+        // Throw error if final screenshot is still too large
         if (buffer.length > MAX_SIZE) {
             throw new McpError(
                 ErrorCode.InvalidRequest,
@@ -455,6 +468,7 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
             .filter((r): r is Resource => r !== undefined)
     ];
 
+    // Return compiled list of resources
     return { resources };
 });
 
@@ -471,6 +485,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
             );
         }
 
+        // Return compiled list of resources
         return {
             contents: [{
                 uri,
@@ -522,8 +537,11 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
         try {
             // Read the binary data and convert to base64
             const screenshotData = await fs.promises.readFile(result.screenshotPath);
+
+            // Convert Buffer to base64 string before returning
             const base64Data = screenshotData.toString('base64');
 
+            // Return compiled list of resources
             return {
                 contents: [{
                     uri,
@@ -532,6 +550,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
                 }]
             };
         } catch (error: unknown) {
+            // Handle error if screenshot cannot be read
             const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
             throw new McpError(
                 ErrorCode.InternalError,
@@ -719,10 +738,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<ToolRes
                     await withRetry(async () => {
                         await Promise.all([
                             page.keyboard.press('Enter'),
-                            page.waitForNavigation({
-                                waitUntil: 'networkidle',
-                                timeout: 15000
-                            })
+                            page.waitForLoadState('networkidle', { timeout: 15000 }),
                         ]);
                     });
 
@@ -761,6 +777,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<ToolRes
                             throw new Error('No valid search results found');
                         }
 
+                        // Return compiled list of results
                         return results;
                     });
 
@@ -774,6 +791,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<ToolRes
                         });
                     });
 
+                    // Return compiled list of results
                     return searchResults;
                 });
 
@@ -871,7 +889,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<ToolRes
                             title: result.pageResult.title,
                             content: result.pageResult.content,
                             timestamp: result.pageResult.timestamp,
-                            screenshot: result.screenshotUri ? `View screenshot at: ${result.screenshotUri}` : undefined
+                            screenshot: result.screenshotUri ? `View screenshot via *MCP Resources* (Paperclip icon) @ URI: ${result.screenshotUri}` : undefined
                         }, null, 2)
                     }]
                 };
@@ -934,7 +952,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<ToolRes
                 return {
                     content: [{
                         type: "text" as const,
-                        text: `Screenshot taken successfully. You can view it at: ${resourceUri}`
+                        text: `Screenshot taken successfully. You can view it via *MCP Resources* (Paperclip icon) @ URI: ${resourceUri}`
                     }]
                 };
             } catch (error) {
@@ -1033,7 +1051,7 @@ async function ensureBrowser(): Promise<Page> {
     // Launch browser if not already running
     if (!browser) {
         browser = await chromium.launch({
-            headless: true, // Run in headless mode for automation
+            headless: true,  // Run in headless mode for automation
         });
 
         // Create initial context and page
