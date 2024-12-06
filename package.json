@@ -1,11 +1,11 @@
 {
   "name": "@modelcontextprotocol/server-webresearch",
   "version": "0.1.0",
-  "description": "MCP server for web research using Puppeteer",
+  "description": "MCP server for deep web research",
   "license": "MIT",
-  "author": "Anthropic, PBC (https://anthropic.com)",
-  "homepage": "https://modelcontextprotocol.io",
-  "bugs": "https://github.com/modelcontextprotocol/servers/issues",
+  "author": "",
+  "homepage": "",
+  "bugs": "",
   "type": "module",
   "bin": {
     "mcp-server-webresearch": "dist/index.js"
@@ -21,19 +21,13 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.0.1",
-    "@types/sharp": "^0.32.0",
-    "@types/turndown": "^5.0.4",
-    "puppeteer": "^23.4.0",
-    "sharp": "^0.33.5",
-    "turndown": "^7.1.2",
-    "axios": "^1.6.2",
-    "form-data": "^4.0.0"
+    "playwright": "^1.49.0",
+    "turndown": "^7.1.2"
   },
   "devDependencies": {
-    "@types/axios": "^0.14.0",
-    "@types/form-data": "^2.5.0",
     "shx": "^0.3.4",
     "tsx": "^4.19.2",
-    "typescript": "^5.6.2"
+    "typescript": "^5.6.2",
+    "@types/turndown": "^5.0.4"
   }
 }

@@ -19,10 +19,15 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 // Web scraping and content processing dependencies
-import puppeteer, { Browser, Page } from "puppeteer";
+import { chromium, Browser, Page } from 'playwright';
 import TurndownService from "turndown";
 import type { Node } from "turndown";
-import sharp from 'sharp';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
+
+// Initialize temp directory for screenshots
+const SCREENSHOTS_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-screenshots-'));
 
 // Initialize Turndown service for converting HTML to Markdown
 // Configure with specific formatting preferences
@@ -70,7 +75,7 @@ interface ResearchResult {
     title: string;           // Page title
     content: string;         // Extracted content in markdown
     timestamp: string;       // When the result was captured
-    screenshot?: string;     // Optional base64 encoded screenshot
+    screenshotPath?: string; // Path to screenshot file on disk
 }
 
 // Define structure for research session data
@@ -78,6 +83,45 @@ interface ResearchSession {
     query: string;           // Search query that initiated the session
     results: ResearchResult[];  // Collection of research results
     lastUpdated: string;     // Timestamp of last update
+}
+
+// Screenshot management functions
+async function saveScreenshot(screenshot: string, title: string): Promise<string> {
+    const buffer = Buffer.from(screenshot, 'base64');
+
+    // Check size before saving
+    const MAX_SIZE = 5 * 1024 * 1024; // 5MB
+    if (buffer.length > MAX_SIZE) {
+        throw new McpError(
+            ErrorCode.InvalidRequest,
+            `Screenshot too large: ${Math.round(buffer.length / (1024 * 1024))}MB exceeds ${MAX_SIZE / (1024 * 1024)}MB limit`
+        );
+    }
+
+    const timestamp = new Date().getTime();
+    const safeTitle = title.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+    const filename = `${safeTitle}-${timestamp}.png`;
+    const filepath = path.join(SCREENSHOTS_DIR, filename);
+
+    // Save the validated screenshot
+    await fs.promises.writeFile(filepath, buffer);
+
+    return filepath;
+}
+
+// Cleanup function to remove all screenshots from disk
+async function cleanupScreenshots(): Promise<void> {
+    try {
+        // Remove all files in the screenshots directory
+        const files = await fs.promises.readdir(SCREENSHOTS_DIR);
+        await Promise.all(files.map(file =>
+            fs.promises.unlink(path.join(SCREENSHOTS_DIR, file))
+        ));
+        // Remove the directory itself
+        await fs.promises.rmdir(SCREENSHOTS_DIR);
+    } catch (error) {
+        console.error('Error cleaning up screenshots:', error);
+    }
 }
 
 // Available tools for web research functionality
@@ -146,13 +190,8 @@ let currentSession: ResearchSession | undefined;  // Current research session da
 
 // Configuration constants for session management
 const MAX_RESULTS_PER_SESSION = 100;  // Maximum number of results to store per session
-const MAX_CONTENT_LENGTH = 100000;    // Maximum content length (100KB) per result
 const MAX_RETRIES = 3;                // Maximum retry attempts for operations
 const RETRY_DELAY = 1000;             // Delay between retries in milliseconds
-
-// Screenshot dimension constraints to ensure reasonable image sizes
-const MAX_SCREENSHOT_DIMENSION = 10000;  // Maximum allowed width/height in pixels
-const MIN_SCREENSHOT_DIMENSION = 100;    // Minimum allowed width/height in pixels
 
 // Generic retry mechanism for handling transient failures
 async function withRetry<T>(
@@ -180,7 +219,7 @@ async function withRetry<T>(
 
 // Add a new research result to the current session with data management
 function addResult(result: ResearchResult): void {
-    // Initialize new session if none exists
+    // If no current session exists, initialize a new one
     if (!currentSession) {
         currentSession = {
             query: "Research Session",
@@ -189,28 +228,12 @@ function addResult(result: ResearchResult): void {
         };
     }
 
-    // Enforce content size limits to prevent memory issues
-    if (result.content && result.content.length > MAX_CONTENT_LENGTH) {
-        result.content = result.content.substring(0, MAX_CONTENT_LENGTH) + '... (content truncated)';
-    }
-
-    // Implement FIFO queue for results management
+    // If the session has reached the maximum number of results, remove the oldest result
     if (currentSession.results.length >= MAX_RESULTS_PER_SESSION) {
-        const removedResult = currentSession.results.shift();
-        // Clean up associated screenshot data if present
-        if (removedResult?.screenshot) {
-            // Remove screenshot data from memory
-            if (removedResult.screenshot) {
-                delete removedResult.screenshot;
-                // Notify clients that resource list has changed
-                server.notification({
-                    method: "notifications/resources/list_changed"
-                });
-            }
-        }
+        currentSession.results.shift();
     }
 
-    // Add new result and update session timestamp
+    // Add the new result to the session and update the last updated timestamp
     currentSession.results.push(result);
     currentSession.lastUpdated = new Date().toISOString();
 }
@@ -220,8 +243,8 @@ async function safePageNavigation(page: Page, url: string): Promise<void> {
     try {
         // Initial navigation with minimal wait conditions
         const response = await page.goto(url, {
-            waitUntil: ['domcontentloaded'],
-            timeout: 15000 // 15s timeout
+            waitUntil: 'domcontentloaded',
+            timeout: 15000
         });
 
         // Log warning if navigation resulted in no response
@@ -306,135 +329,83 @@ async function safePageNavigation(page: Page, url: string): Promise<void> {
     }
 }
 
-// Take and optimize a screenshot with size constraints
-async function takeScreenshotWithSizeLimit(
-    page: Page,                    // Puppeteer page to screenshot
-    maxSizeBytes: number = 500000  // Maximum file size (500KB default)
-): Promise<string> {
-    // Track Sharp instance for proper cleanup
-    let sharpInstance: sharp.Sharp | undefined;
+// Take and optimize a screenshot
+async function takeScreenshotWithSizeLimit(page: Page): Promise<string> {
+    const MAX_SIZE = 5 * 1024 * 1024;
+    const MAX_DIMENSION = 1920;
+    const MIN_DIMENSION = 800;
 
-    try {
-        // Step 1: Get page dimensions while respecting maximum limits
-        const dimensions = await page.evaluate((maxDimension) => ({
-            width: Math.min(document.documentElement.scrollWidth, maxDimension),
-            height: Math.min(document.documentElement.scrollHeight, maxDimension)
-        }), MAX_SCREENSHOT_DIMENSION);
+    // Set viewport size
+    await page.setViewportSize({
+        width: 1600,
+        height: 900
+    });
 
-        // Step 2: Validate minimum dimensions
-        if (dimensions.width < MIN_SCREENSHOT_DIMENSION || dimensions.height < MIN_SCREENSHOT_DIMENSION) {
-            throw new Error('Page dimensions too small for screenshot');
-        }
+    // Take initial screenshot
+    let screenshot = await page.screenshot({
+        type: 'png',
+        fullPage: false
+    });
 
-        // Step 3: Configure viewport to match content dimensions
-        await page.setViewport({
-            width: dimensions.width,
-            height: dimensions.height
+    // Handle buffer conversion
+    let buffer = screenshot;
+    let attempts = 0;
+    const MAX_ATTEMPTS = 3;
+
+    while (buffer.length > MAX_SIZE && attempts < MAX_ATTEMPTS) {
+        // Get current viewport size
+        const viewport = page.viewportSize();
+        if (!viewport) continue;
+
+        // Calculate new dimensions
+        const scaleFactor = Math.pow(0.75, attempts + 1);
+        let newWidth = Math.round(viewport.width * scaleFactor);
+        let newHeight = Math.round(viewport.height * scaleFactor);
+
+        // Ensure dimensions are within bounds
+        newWidth = Math.max(MIN_DIMENSION, Math.min(MAX_DIMENSION, newWidth));
+        newHeight = Math.max(MIN_DIMENSION, Math.min(MAX_DIMENSION, newHeight));
+
+        // Update viewport with new dimensions
+        await page.setViewportSize({
+            width: newWidth,
+            height: newHeight
         });
 
-        // Step 4: Take full page screenshot
-        const screenshot = await page.screenshot({
-            type: 'png',         // Use PNG for better quality
-            encoding: 'base64',  // Get result as base64 string
-            fullPage: true       // Capture entire page
+        // Take new screenshot
+        screenshot = await page.screenshot({
+            type: 'png',
+            fullPage: false
         });
 
-        // Step 5: Validate screenshot data
-        if (typeof screenshot !== 'string') {
-            throw new Error('Screenshot failed: Invalid encoding');
-        }
-
-        // Step 6: Check if size is already within limits
-        const approximateBytes = Math.ceil(screenshot.length * 0.75);  // base64 to binary ratio
-        console.error(`Original screenshot size: ~${approximateBytes} bytes`);
-
-        // Return as-is if size is acceptable
-        if (approximateBytes <= maxSizeBytes) {
-            return screenshot;
-        }
-
-        // Step 7: Process oversized screenshot
-        const buffer = Buffer.from(screenshot, 'base64');
-
-        try {
-            // Initialize Sharp for image processing
-            sharpInstance = sharp(buffer);
-
-            // Get actual image dimensions
-            const metadata = await sharpInstance.metadata();
-            const originalWidth = metadata.width || dimensions.width;
-            const originalHeight = metadata.height || dimensions.height;
-            console.error(`Original dimensions: ${originalWidth}x${originalHeight}`);
-
-            // Step 8: Progressive image resizing
-            let scale = Math.sqrt(maxSizeBytes / approximateBytes) * 0.8;  // Initial scale with 20% margin
-            let attempts = 0;
-            const maxAttempts = 5;  // Limit resize attempts
-
-            // Try different scales until size requirement is met
-            while (attempts < maxAttempts) {
-                // Calculate new dimensions while maintaining aspect ratio
-                const newWidth = Math.max(MIN_SCREENSHOT_DIMENSION, Math.floor(originalWidth * scale));
-                const newHeight = Math.max(MIN_SCREENSHOT_DIMENSION, Math.floor(originalHeight * scale));
-                console.error(`Attempt ${attempts + 1}: Resizing to ${newWidth}x${newHeight} (scale: ${scale.toFixed(2)})`);
-
-                // Create new Sharp instance for this attempt
-                const resizeInstance = sharp(buffer)
-                    .resize(newWidth, newHeight, {
-                        fit: 'inside',             // Maintain aspect ratio
-                        withoutEnlargement: true   // Prevent upscaling
-                    })
-                    .png({
-                        compressionLevel: 9,  // Maximum PNG compression
-                        quality: 40,          // Reduced quality
-                        effort: 10            // Maximum compression effort
-                    });
-
-                // Process image and check size
-                const resized = await resizeInstance.toBuffer();
-                console.error(`Resized image size: ${resized.length} bytes`);
-
-                // Return if size requirement met
-                if (resized.length <= maxSizeBytes) {
-                    return resized.toString('base64');
-                }
-
-                scale *= 0.7;  // Reduce scale by 30% for next attempt
-                attempts++;
-            }
-
-            // Step 9: Final fallback to minimum size
-            const finalInstance = sharp(buffer)
-                .resize(
-                    Math.max(MIN_SCREENSHOT_DIMENSION, 640),  // Minimum width with 640px floor
-                    Math.max(MIN_SCREENSHOT_DIMENSION, 480),  // Minimum height with 480px floor
-                    {
-                        fit: 'inside',
-                        withoutEnlargement: true
-                    }
-                )
-                .png({
-                    compressionLevel: 9,  // Maximum compression
-                    quality: 20,          // Lowest acceptable quality
-                    effort: 10            // Maximum compression effort
-                });
-
-            // Return final attempt result regardless of size
-            const finalAttempt = await finalInstance.toBuffer();
-            return finalAttempt.toString('base64');
-
-        } finally {
-            // Step 10: Clean up Sharp instance
-            if (sharpInstance) {
-                await sharpInstance.destroy();
-            }
-        }
-
-    } catch (error) {
-        // Log and rethrow any errors
-        console.error('Screenshot error:', error);
-        throw error;
+        buffer = screenshot;
+        attempts++;
     }
+
+    if (buffer.length > MAX_SIZE) {
+        // Final attempt with minimum settings
+        await page.setViewportSize({
+            width: MIN_DIMENSION,
+            height: MIN_DIMENSION
+        });
+
+        screenshot = await page.screenshot({
+            type: 'png',
+            fullPage: false
+        });
+
+        buffer = screenshot;
+
+        if (buffer.length > MAX_SIZE) {
+            throw new McpError(
+                ErrorCode.InvalidRequest,
+                `Failed to reduce screenshot to under 5MB even with minimum settings`
+            );
+        }
+    }
+
+    // Convert Buffer to base64 string before returning
+    return buffer.toString('base64');
 }
 
 // Initialize MCP server with basic configuration
@@ -475,13 +446,13 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
         },
         // Add screenshot resources if available
         ...currentSession.results
-            .filter(r => r.screenshot)               // Only include results with screenshots
-            .map((r, i) => ({
-                uri: `research://screenshots/${i}`,  // Unique URI for each screenshot
+            .map((r, i): Resource | undefined => r.screenshotPath ? {
+                uri: `research://screenshots/${i}`,
                 name: `Screenshot of ${r.title}`,
                 description: `Screenshot taken from ${r.url}`,
                 mimeType: "image/png"
-            }))
+            } : undefined)
+            .filter((r): r is Resource => r !== undefined)
     ];
 
     return { resources };
@@ -511,7 +482,8 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
                     results: currentSession.results.map(r => ({
                         title: r.title,
                         url: r.url,
-                        timestamp: r.timestamp
+                        timestamp: r.timestamp,
+                        screenshotPath: r.screenshotPath
                     }))
                 }, null, 2)
             }]
@@ -540,20 +512,32 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 
         // Get result containing screenshot
         const result = currentSession.results[index];
-        if (!result?.screenshot) {
+        if (!result?.screenshotPath) {
             throw new McpError(
                 ErrorCode.InvalidRequest,
                 `No screenshot available at index: ${index}`
             );
         }
 
-        return {
-            contents: [{
-                uri,
-                mimeType: "image/png",
-                blob: result.screenshot
-            }]
-        };
+        try {
+            // Read the binary data and convert to base64
+            const screenshotData = await fs.promises.readFile(result.screenshotPath);
+            const base64Data = screenshotData.toString('base64');
+
+            return {
+                contents: [{
+                    uri,
+                    mimeType: "image/png",
+                    blob: base64Data
+                }]
+            };
+        } catch (error: unknown) {
+            const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
+            throw new McpError(
+                ErrorCode.InternalError,
+                `Failed to read screenshot: ${errorMessage}`
+            );
+        }
     }
 
     // Handle unknown resource types
@@ -563,10 +547,9 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     );
 });
 
-// Initialize server connection using stdio transport
+// Initialize MCP server connection using stdio transport
 const transport = new StdioServerTransport();
 server.connect(transport).catch((error) => {
-    // Log initialization errors and exit
     console.error("Failed to start server:", error);
     process.exit(1);
 });
@@ -735,10 +718,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<ToolRes
                     // Step 4: Submit search and wait for results
                     await withRetry(async () => {
                         await Promise.all([
-                            page.keyboard.press('Enter'),             // Submit search
-                            page.waitForNavigation({                  // Wait for results page
-                                waitUntil: ['load', 'networkidle0'],  // Wait until page loads and network is idle
-                                timeout: 15000                        // 15s timeout for navigation
+                            page.keyboard.press('Enter'),
+                            page.waitForNavigation({
+                                waitUntil: 'networkidle',
+                                timeout: 15000
                             })
                         ]);
                     });
@@ -825,7 +808,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<ToolRes
             if (!isValidUrl(url)) {
                 return {
                     content: [{
-                        type: "text",
+                        type: "text" as const,
                         text: `Invalid URL: ${url}. Only http and https protocols are supported.`
                     }],
                     isError: true
@@ -858,10 +841,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<ToolRes
                     };
 
                     // Step 5: Take screenshot if requested
+                    let screenshotUri: string | undefined;
                     if (takeScreenshot) {
                         // Capture and process screenshot
                         const screenshot = await takeScreenshotWithSizeLimit(page);
-                        pageResult.screenshot = screenshot;
+                        pageResult.screenshotPath = await saveScreenshot(screenshot, title);
+
+                        // Get the index for the resource URI
+                        const resultIndex = currentSession ? currentSession.results.length : 0;
+                        screenshotUri = `research://screenshots/${resultIndex}`;
 
                         // Notify clients about new screenshot resource
                         server.notification({
@@ -871,25 +859,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<ToolRes
 
                     // Step 6: Store result in session
                     addResult(pageResult);
-                    return pageResult;
+                    return { pageResult, screenshotUri };
                 });
 
-                // Step 7: Return formatted result
-                return {
+                // Step 7: Return formatted result with screenshot URI if taken
+                const response: ToolResult = {
                     content: [{
-                        type: "text",
+                        type: "text" as const,
                         text: JSON.stringify({
-                            ...result,
-                            // Replace screenshot data with availability message
-                            screenshot: result.screenshot ? "Screenshot taken and available as a Resource (Paperclip icon -> Attach from MCP)." : undefined
-                        }, null, 2)  // Pretty-print JSON
+                            url: result.pageResult.url,
+                            title: result.pageResult.title,
+                            content: result.pageResult.content,
+                            timestamp: result.pageResult.timestamp,
+                            screenshot: result.screenshotUri ? `View screenshot at: ${result.screenshotUri}` : undefined
+                        }, null, 2)
                     }]
                 };
+
+                return response;
             } catch (error) {
                 // Handle and format page visit errors
                 return {
                     content: [{
-                        type: "text",
+                        type: "text" as const,
                         text: `Failed to visit page: ${(error as Error).message}`
                     }],
                     isError: true
@@ -901,7 +893,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<ToolRes
         case "take_screenshot": {
             try {
                 // Step 1: Capture screenshot with retry mechanism
-                const shot = await withRetry(async () => {
+                const screenshot = await withRetry(async () => {
                     // Take and optimize screenshot with default size limits
                     return await takeScreenshotWithSizeLimit(page);
                 });
@@ -919,32 +911,37 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<ToolRes
                 const pageUrl = await page.url();      // Current page URL
                 const pageTitle = await page.title();  // Current page title
 
-                // Step 4: Create and store screenshot result
+                // Step 4: Save screenshot to disk
+                const screenshotPath = await saveScreenshot(screenshot, pageTitle || 'untitled');
+
+                // Step 5: Create and store screenshot result
+                const resultIndex = currentSession ? currentSession.results.length : 0;
                 addResult({
                     url: pageUrl,
                     title: pageTitle || "Untitled Page",  // Fallback title if none available
                     content: "Screenshot taken",          // Simple content description
                     timestamp: new Date().toISOString(),  // Capture time
-                    screenshot: shot                      // Screenshot data
+                    screenshotPath                        // Path to screenshot file
                 });
 
-                // Step 5: Notify clients about new screenshot resource
+                // Step 6: Notify clients about new screenshot resource
                 server.notification({
                     method: "notifications/resources/list_changed"
                 });
 
-                // Step 6: Return success message
+                // Step 7: Return success message with resource URI
+                const resourceUri = `research://screenshots/${resultIndex}`;
                 return {
                     content: [{
-                        type: "text",
-                        text: "Screenshot taken successfully. The screenshot is now available as a resource."
+                        type: "text" as const,
+                        text: `Screenshot taken successfully. You can view it at: ${resourceUri}`
                     }]
                 };
             } catch (error) {
                 // Handle and format screenshot errors
                 return {
                     content: [{
-                        type: "text",
+                        type: "text" as const,
                         text: `Failed to take screenshot: ${(error as Error).message}`
                     }],
                     isError: true
@@ -1032,182 +1029,47 @@ Do *NOT* use the following tools:
     throw new McpError(ErrorCode.InvalidRequest, "Prompt implementation not found");
 });
 
-// Constants for cleanup operations
-const CLEANUP_TIMEOUT_MS = 5000;  // Maximum time to wait for cleanup (5 seconds)
-
-// Perform cleanup with timeout protection to prevent hanging
-async function cleanupWithTimeout(): Promise<void> {
-    return Promise.race([
-        // Attempt normal cleanup
-        (async () => {
-            if (browser) {
-                await browser.close();
-            }
-        })(),
-        // Timeout after defined period
-        new Promise<void>((_, reject) =>
-            setTimeout(() => reject(new Error('Cleanup timeout')), CLEANUP_TIMEOUT_MS)
-        )
-    ]) as Promise<void>;
-}
-
-// Clean up browser resources and handles
-async function cleanupBrowser(): Promise<void> {
-    if (browser) {
-        try {
-            // Clean up page resources first
-            if (page) {
-                await page.removeAllListeners();  // Remove event listeners
-                await page.close().catch(console.error);  // Close page
-            }
-            // Close browser instance
-            await browser.close().catch(console.error);
-        } catch (error) {
-            console.error('Error during browser cleanup:', error);
-        } finally {
-            // Reset references regardless of cleanup success
-            browser = undefined;
-            page = undefined;
-        }
-    }
-}
-
-// Process termination handlers
-process.on('SIGINT', async () => {
-    // Handle user-initiated termination (Ctrl+C)
-    console.error('Shutting down...');
-    await cleanupBrowser();
-    await cleanupWithTimeout();
-    process.exit(0);
-});
-
-process.on('SIGTERM', async () => {
-    // Handle system-initiated termination
-    console.error('Received SIGTERM signal...');
-    try {
-        await cleanupWithTimeout();
-        process.exit(0);
-    } catch (error) {
-        console.error('Fatal error during SIGTERM cleanup:', error);
-        process.exit(1);
-    }
-});
-
-process.on('uncaughtException', async (error) => {
-    // Handle unexpected errors
-    console.error('Uncaught exception:', error);
-    try {
-        await cleanupWithTimeout();
-        process.exit(1);
-    } catch (cleanupError) {
-        console.error('Fatal error during uncaught exception cleanup:', cleanupError);
-        process.exit(1);
-    }
-});
-
-// Ensure browser instance is available and properly configured
 async function ensureBrowser(): Promise<Page> {
+    // Launch browser if not already running
+    if (!browser) {
+        browser = await chromium.launch({
+            headless: true, // Run in headless mode for automation
+        });
+
+        // Create initial context and page
+        const context = await browser.newContext();
+        page = await context.newPage();
+    }
+
+    // Create new page if current one is closed/invalid
+    if (!page) {
+        const context = await browser.newContext();
+        page = await context.newPage();
+    }
+
+    // Return the current page
+    return page;
+}
+
+// Cleanup function
+async function cleanup() {
     try {
-        // Handle disconnected browser with existing page
-        // If browser is disconnected/missing but page exists, clean up page
-        if ((!browser || browser.connected === false) && page) {
-            await page.removeAllListeners();  // Remove all event listeners from page
-            page = undefined;  // Clear page reference
-        }
+        // Clean up screenshots first
+        await cleanupScreenshots();
 
-        // Initialize or reinitialize browser if needed
-        // If browser is missing or disconnected, create new browser instance
-        if (!browser || browser.connected === false) {
-            // Clean up existing browser if present
-            if (browser) {
-                try {
-                    await browser.close();  // Close existing browser
-                } catch (error) {
-                    console.error('Error closing existing browser:', error);
-                }
-                browser = undefined;  // Clear browser reference
-            }
-
-            // Launch new browser instance with security and performance settings
-            browser = await puppeteer.launch({
-                headless: true,  // Run in headless mode
-                args: [
-                    '--no-sandbox',              // Disable sandbox for containerized environments
-                    '--disable-setuid-sandbox',  // Disable setuid sandbox for stability
-                    '--disable-dev-shm-usage',   // Disable shared memory usage
-                    '--disable-gpu',             // Disable GPU hardware acceleration
-                    '--window-size=1920,1080'    // Set default window size
-                ]
-            });
-
-            // Handle browser disconnection events
-            browser.on('disconnected', async () => {
-                if (page) {
-                    await page.removeAllListeners();  // Clean up page listeners
-                }
-                browser = undefined;  // Clear browser reference
-                page = undefined;  // Clear page reference
-            });
-        }
-
-        // Initialize or reinitialize page if needed
-        // Create new page if none exists or current is closed
-        if (!page || page.isClosed()) {
-            const pages = await browser.pages();  // Get existing pages
-            page = pages[0] || await browser.newPage();  // Use first page or create new
-            await page.setViewport({ width: 1920, height: 1080 });  // Set viewport dimensions
-            await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36');  // Set user agent
-
-            // Handle page errors
-            page.on('error', error => {
-                console.error('Page error:', error);
-                page = undefined;  // Clear page reference on error
-            });
-
-            // Enable request interception for resource control
-            await page.setRequestInterception(true);
-            // Handle individual requests
-            page.on('request', async request => {
-                try {
-                    // Block media and PDF requests, allow others
-                    if (request.resourceType() === 'media' || request.url().endsWith('.pdf')) {
-                        await request.abort();  // Block request
-                    } else {
-                        await request.continue();  // Allow request
-                    }
-                } catch (error: unknown) {
-                    // Check if error is already handled
-                    const isAlreadyHandledError = error instanceof Error &&
-                        (error.message.includes('Request is already handled') ||
-                            error.message.includes('Request Interception is not enabled'));
-                    // Handle unhandled errors
-                    if (!isAlreadyHandledError) {
-                        console.error('Request interception error:', error);
-                        try {
-                            await request.abort();  // Attempt to abort request
-                        } catch (abortError) {
-                            // Log abort failures unless already handled
-                            if (!(abortError instanceof Error && abortError.message.includes('Request is already handled'))) {
-                                console.error('Failed to abort request:', abortError);
-                            }
-                        }
-                    }
-                }
-            });
-        }
-
-        return page;  // Return configured page
-    } catch (error) {
-        // Handle initialization errors
+        // Then close the browser
         if (browser) {
-            try {
-                await browser.close();  // Clean up browser
-            } catch (closeError) {
-                console.error('Error closing browser during error cleanup:', closeError);
-            }
-            browser = undefined;  // Clear browser reference
+            await browser.close();
         }
-        page = undefined;  // Clear page reference
-        throw new McpError(ErrorCode.InternalError, `Failed to initialize browser: ${(error as Error).message}`);
+    } catch (error) {
+        console.error('Error during cleanup:', error);
+    } finally {
+        browser = undefined;
+        page = undefined;
     }
 }
+
+// Register cleanup handlers
+process.on('exit', cleanup);
+process.on('SIGTERM', cleanup);
+process.on('SIGINT', cleanup);
