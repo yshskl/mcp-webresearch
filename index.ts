@@ -1047,6 +1047,7 @@ Do *NOT* use the following tools:
     throw new McpError(ErrorCode.InvalidRequest, "Prompt implementation not found");
 });
 
+// Ensures browser is running, and creates a new page if needed
 async function ensureBrowser(): Promise<Page> {
     // Launch browser if not already running
     if (!browser) {
@@ -1070,7 +1071,7 @@ async function ensureBrowser(): Promise<Page> {
 }
 
 // Cleanup function
-async function cleanup() {
+async function cleanup(): Promise<void> {
     try {
         // Clean up screenshots first
         await cleanupScreenshots();
