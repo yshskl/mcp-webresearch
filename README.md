@@ -1,100 +1,110 @@
-# Web Research MCP Server
+# MCP Web Research Server
 
-An MCP server that enables LLM clients to perform web research using Puppeteer. This server provides tools for searching Google, visiting web pages, extracting content, and taking screenshots.
+A Model Context Protocol (MCP) server for web research. 
+
+This server provides AI models (for now, Claude via the Claude Desktop app) the ability to perform Google searches, visit web pages, and capture screenshots while maintaining a research session.
+
+## Features
+
+- Google search integration
+- Webpage content extraction
+- Research session tracking (list of visited pages, search queries, etc.)
+- Screenshot capture
+
+## Prerequisites
+
+- [Node.js](https://nodejs.org/) >= 18 (includes `npm` and `npx`)
+- [Claude Desktop app](https://claude.ai/download)
 
 ## Installation
 
-```bash
-npx @modelcontextprotocol/server-webresearch
-```
+First, ensure you've downloaded and installed the [Claude Desktop app](https://claude.ai/download) and you have npm installed.
 
-## Usage with Claude Desktop
-
-Add this to your `claude_desktop_config.json`:
+Next, add this entry to your `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "webresearch": {
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-webresearch"]
+      "args": ["-y", "@mzxrai/mcp-webresearch"]
     }
   }
 }
 ```
 
-## Features
+This config allows Claude Desktop to automatically start the web research MCP server when needed.
 
-### Tools
+## Usage
 
-1. **search_google**
-   - Search Google and extract search results
-   - Arguments: `query` (string)
+Simply start a chat with Claude and send a prompt that would benefit from web research. If you'd like a prebuilt prompt customized for deeper web research, you can use the `agentic-research` prompt that we provide through this package. Access that prompt in Claude Desktop by clicking the Paperclip icon in the chat input and then selecting `Choose an integration` -> `webresearch` -> `agentic-research`.
 
-2. **visit_page**
-   - Visit a webpage and extract its content
-   - Arguments: 
-     - `url` (string)
-     - `takeScreenshot` (boolean, optional)
+<img src="https://i.ibb.co/N6Y3C0q/Screenshot-2024-12-05-at-11-01-27-PM.png" alt="Example screenshot of web research" width="400"/>
 
-3. **extract_content**
-   - Extract specific content from the current page
-   - Arguments: `selector` (string, CSS selector)
+### Available Tools
 
-4. **take_screenshot**
-   - Take a screenshot of the current page or element
-   - Arguments: `selector` (string, optional CSS selector)
+1. `search_google`
+   - Performs Google searches and extracts results
+   - Arguments: `{ query: string }`
 
-### Resources
+2. `visit_page`
+   - Visits a webpage and extracts its content
+   - Arguments: `{ url: string, takeScreenshot?: boolean }`
 
-The server maintains a research session that stores:
+3. `take_screenshot`
+   - Takes a screenshot of the current page
+   - No arguments required
+
+### Available Prompts
+
+#### `agentic-research`
+A guided research prompt that helps Claude conduct thorough web research. The prompt instructs Claude to:
+- Start with broad searches to understand the topic landscape
+- Prioritize high-quality, authoritative sources
+- Iteratively refine the research direction based on findings
+- Keep you informed and let you guide the research interactively
+- Always cite sources with URLs
+
+### Research Session Management
+
+The server maintains a research session that includes:
 - Search queries
 - Visited pages
 - Extracted content
 - Screenshots
 - Timestamps
 
-Access the current research session via the `research://` URI scheme.
+You can access it via the Paperclip icon in Claude Desktop.
 
-## Example Usage
+### Resources
 
-Here are some example prompts you can use with Claude Desktop:
-
-1. Basic research:
-   ```
-   Can you research the latest developments in quantum computing?
-   ```
-
-2. Focused research:
-   ```
-   I need to learn about TypeScript decorators. Can you find and summarize some good documentation?
-   ```
-
-3. Visual research:
-   ```
-   Can you show me what the React.js homepage looks like and extract its main features?
-   ```
+When you take a screenshot, it's saved as an MCP resource. You can access captured screenshots in Claude Desktop via the Paperclip icon as well.
 
 ## Development
 
-1. Clone the repository
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-3. Build:
-   ```bash
-   npm run build
-   ```
-4. Watch mode for development:
-   ```bash
-   npm run watch
-   ```
+```bash
+# Install dependencies
+pnpm install
+
+# Build the project
+pnpm build
+
+# Watch for changes
+pnpm watch
+
+# Run in development mode
+pnpm dev
+```
+
+## Requirements
+
+- Node.js >= 18
+- Playwright (automatically installed as a dependency)
 
 ## License
 
-MIT License
+MIT
 
-## Contributing
+## Author
 
-Contributions are welcome! Please feel free to submit a Pull Request. 
+[mzxrai](https://github.com/mzxrai) 
