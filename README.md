@@ -20,7 +20,7 @@ This server provides AI models (for now, Claude via the Claude Desktop app) the 
 
 First, ensure you've downloaded and installed the [Claude Desktop app](https://claude.ai/download) and you have npm installed.
 
-Next, add this entry to your `claude_desktop_config.json`:
+Next, add this entry to your `claude_desktop_config.json` (on Mac, found at `~/Library/Application\ Support/Claude/claude_desktop_config.json`):
 
 ```json
 {
@@ -41,7 +41,7 @@ Simply start a chat with Claude and send a prompt that would benefit from web re
 
 <img src="https://i.ibb.co/N6Y3C0q/Screenshot-2024-12-05-at-11-01-27-PM.png" alt="Example screenshot of web research" width="400"/>
 
-### Available Tools
+### Tools
 
 1. `search_google`
    - Performs Google searches and extracts results
@@ -55,7 +55,7 @@ Simply start a chat with Claude and send a prompt that would benefit from web re
    - Takes a screenshot of the current page
    - No arguments required
 
-### Available Prompts
+### Prompts
 
 #### `agentic-research`
 A guided research prompt that helps Claude conduct thorough web research. The prompt instructs Claude to:
@@ -65,7 +65,15 @@ A guided research prompt that helps Claude conduct thorough web research. The pr
 - Keep you informed and let you guide the research interactively
 - Always cite sources with URLs
 
-### Research Session Management
+### Resources
+
+We expose two things as MCP resources: (1) captured webpage screenshots, and (2) the research session.
+
+#### Screenshots
+
+When you take a screenshot, it's saved as an MCP resource. You can access captured screenshots in Claude Desktop via the Paperclip icon.
+
+#### Research Session
 
 The server maintains a research session that includes:
 - Search queries
@@ -74,11 +82,15 @@ The server maintains a research session that includes:
 - Screenshots
 - Timestamps
 
-You can access it via the Paperclip icon in Claude Desktop.
+## Problems
 
-### Resources
+This is very much pre-alpha code. And it is also AIGC, so expect bugs.
 
-When you take a screenshot, it's saved as an MCP resource. You can access captured screenshots in Claude Desktop via the Paperclip icon as well.
+If you run into issues, it may be helpful to check Claude Desktop's MCP logs:
+
+```bash
+tail -n 20 -f ~/Library/Logs/Claude/mcp*.log
+```
 
 ## Development
 
@@ -100,6 +112,11 @@ pnpm dev
 
 - Node.js >= 18
 - Playwright (automatically installed as a dependency)
+
+## Verified Platforms
+
+- [x] macOS
+- [ ] Linux
 
 ## License
 
