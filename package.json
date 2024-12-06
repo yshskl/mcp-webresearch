@@ -1,11 +1,11 @@
 {
-  "name": "@modelcontextprotocol/server-webresearch",
+  "name": "@mzxrai/mcp-webresearch",
   "version": "0.1.0",
-  "description": "MCP server for deep web research",
+  "description": "MCP server for web research",
   "license": "MIT",
-  "author": "",
-  "homepage": "",
-  "bugs": "",
+  "author": "mzxrai",
+  "homepage": "https://github.com/mzxrai/mcp-webresearch",
+  "bugs": "https://github.com/mzxrai/mcp-webresearch/issues",
   "type": "module",
   "bin": {
     "mcp-server-webresearch": "dist/index.js"
@@ -15,10 +15,20 @@
   ],
   "scripts": {
     "build": "tsc && shx chmod +x dist/*.js",
-    "prepare": "npm run build",
+    "prepare": "pnpm run build",
     "watch": "tsc --watch",
     "dev": "tsx watch index.ts"
   },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "web-research",
+    "ai",
+    "web-scraping"
+  ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.0.1",
     "playwright": "^1.49.0",
