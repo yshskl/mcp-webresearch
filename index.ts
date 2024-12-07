@@ -1092,3 +1092,4 @@ async function cleanup(): Promise<void> {
 process.on('exit', cleanup);
 process.on('SIGTERM', cleanup);
 process.on('SIGINT', cleanup);
+process.on('SIGHUP', cleanup);
