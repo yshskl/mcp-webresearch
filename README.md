@@ -27,7 +27,7 @@ Next, add this entry to your `claude_desktop_config.json` (on Mac, found at `~/L
   "mcpServers": {
     "webresearch": {
       "command": "npx",
-      "args": ["-y", "@mzxrai/mcp-webresearch"]
+      "args": ["-y", "@mzxrai/mcp-webresearch@latest"]
     }
   }
 }
