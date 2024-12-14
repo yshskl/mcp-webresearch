@@ -71,7 +71,7 @@ turndownService.addRule('preserveImages', {
 
 // Core interfaces for research data management
 interface ResearchResult {
-    url: string;              // URL of the researched page
+    url: string;             // URL of the researched page
     title: string;           // Page title
     content: string;         // Extracted content in markdown
     timestamp: string;       // When the result was captured
@@ -80,17 +80,18 @@ interface ResearchResult {
 
 // Define structure for research session data
 interface ResearchSession {
-    query: string;           // Search query that initiated the session
+    query: string;              // Search query that initiated the session
     results: ResearchResult[];  // Collection of research results
-    lastUpdated: string;     // Timestamp of last update
+    lastUpdated: string;        // Timestamp of last update
 }
 
 // Screenshot management functions
 async function saveScreenshot(screenshot: string, title: string): Promise<string> {
+    // Convert screenshot from base64 to buffer
     const buffer = Buffer.from(screenshot, 'base64');
 
     // Check size before saving
-    const MAX_SIZE = 5 * 1024 * 1024; // 5MB
+    const MAX_SIZE = 5 * 1024 * 1024;  // 5MB
     if (buffer.length > MAX_SIZE) {
         throw new McpError(
             ErrorCode.InvalidRequest,
@@ -98,6 +99,7 @@ async function saveScreenshot(screenshot: string, title: string): Promise<string
         );
     }
 
+    // Generate a safe filename
     const timestamp = new Date().getTime();
     const safeTitle = title.replace(/[^a-z0-9]/gi, '_').toLowerCase();
     const filename = `${safeTitle}-${timestamp}.png`;
@@ -106,6 +108,7 @@ async function saveScreenshot(screenshot: string, title: string): Promise<string
     // Save the validated screenshot
     await fs.promises.writeFile(filepath, buffer);
 
+    // Return the filepath to the saved screenshot
     return filepath;
 }
 
@@ -117,6 +120,7 @@ async function cleanupScreenshots(): Promise<void> {
         await Promise.all(files.map(file =>
             fs.promises.unlink(path.join(SCREENSHOTS_DIR, file))
         ));
+
         // Remove the directory itself
         await fs.promises.rmdir(SCREENSHOTS_DIR);
     } catch (error) {
@@ -241,97 +245,89 @@ function addResult(result: ResearchResult): void {
 // Safe page navigation with error handling and bot detection
 async function safePageNavigation(page: Page, url: string): Promise<void> {
     try {
-        // Initial navigation with minimal wait conditions
+        // Step 1: Set cookies to bypass consent banner
+        await page.context().addCookies([{
+            name: 'CONSENT',
+            value: 'YES+',
+            domain: '.google.com',
+            path: '/'
+        }]);
+
+        // Step 2: Initial navigation
         const response = await page.goto(url, {
             waitUntil: 'domcontentloaded',
             timeout: 15000
         });
 
-        // Log warning if navigation resulted in no response
+        // Step 3: Basic response validation
         if (!response) {
-            console.warn('Navigation resulted in no response, but continuing anyway');
-        } else {
-            // Log error if HTTP status code indicates failure
-            const status = response.status();
-            if (status >= 400) {
-                throw new Error(`HTTP ${status}: ${response.statusText()}`);
-            }
+            throw new Error('Navigation failed: no response received');
         }
 
-        // Wait for basic page structure
-        try {
-            await page.waitForSelector('body', { timeout: 3000 });
-        } catch (error) {
-            console.warn('Body selector timeout, but continuing anyway');
+        // Check HTTP status code; if 400 or higher, throw an error
+        const status = response.status();
+        if (status >= 400) {
+            throw new Error(`HTTP ${status}: ${response.statusText()}`);
         }
 
-        // Brief pause for dynamic content
-        await new Promise(resolve => setTimeout(resolve, 500));
+        // Step 4: Wait for network to become idle or timeout
+        await Promise.race([
+            page.waitForLoadState('networkidle', { timeout: 5000 })
+                .catch(() => {/* ignore timeout */ }),
+            // Fallback timeout in case networkidle never occurs
+            new Promise(resolve => setTimeout(resolve, 5000))
+        ]);
 
-        // Check for bot protection and page content with timeout
-        const CONTENT_CHECK_TIMEOUT = 5000; // 5 seconds timeout
-        const pageContent = await Promise.race([
-            page.evaluate(() => {
-                // Common bot protection selectors
-                const botProtectionSelectors = [
-                    '#challenge-running',     // Cloudflare
-                    '#cf-challenge-running',  // Cloudflare
-                    '#px-captcha',            // PerimeterX
-                    '#ddos-protection',       // Various
-                    '#waf-challenge-html'     // Various WAFs
-                ];
+        // Step 5: Security and content validation
+        const validation = await page.evaluate(() => {
+            const botProtectionExists = [
+                '#challenge-running',     // Cloudflare
+                '#cf-challenge-running',  // Cloudflare
+                '#px-captcha',           // PerimeterX
+                '#ddos-protection',       // Various
+                '#waf-challenge-html'     // Various WAFs
+            ].some(selector => document.querySelector(selector));
 
-                // Check for bot protection elements
-                const hasBotProtection = botProtectionSelectors.some(selector =>
-                    document.querySelector(selector) !== null
-                );
+            // Check for suspicious page titles
+            const suspiciousTitle = [
+                'security check',
+                'ddos protection',
+                'please wait',
+                'just a moment',
+                'attention required'
+            ].some(phrase => document.title.toLowerCase().includes(phrase));
 
-                // Extract meaningful text content
-                const meaningfulText = Array.from(document.body.getElementsByTagName('*'))
-                    .map(element => {
-                        if (element.tagName === 'SCRIPT' || element.tagName === 'STYLE' || element.tagName === 'NOSCRIPT') {
-                            return '';
-                        }
-                        return element.textContent || '';
-                    })
-                    .join(' ')
-                    .replace(/\s+/g, ' ')
-                    .trim();
+            // Count words in the page content
+            const bodyText = document.body.innerText || '';
+            const words = bodyText.trim().split(/\s+/).length;
 
-                return {
-                    hasBotProtection,
-                    meaningfulText,
-                    title: document.title
-                };
-            }),
-            new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('Content validation check timed out')), CONTENT_CHECK_TIMEOUT)
-            )
-        ]) as { hasBotProtection: boolean; meaningfulText: string; title: string };
+            // Return validation results
+            return {
+                wordCount: words,
+                botProtection: botProtectionExists,
+                suspiciousTitle,
+                title: document.title
+            };
+        });
 
-        // Handle bot protection detection
-        if (pageContent.hasBotProtection) {
-            throw new Error('Bot protection detected (Cloudflare or similar service)');
+        // If bot protection is detected, throw an error
+        if (validation.botProtection) {
+            throw new Error('Bot protection detected');
         }
 
-        // Validate content quality
-        if (!pageContent.meaningfulText || pageContent.meaningfulText.length < 1000) {
-            throw new Error('Page appears to be empty or has no meaningful content');
+        // If the page title is suspicious, throw an error
+        if (validation.suspiciousTitle) {
+            throw new Error(`Suspicious page title detected: "${validation.title}"`);
         }
 
-        // Check for suspicious titles indicating bot protection
-        const suspiciousTitles = ['security check', 'ddos protection', 'please wait', 'just a moment', 'attention required'];
-        if (suspiciousTitles.some(title => pageContent.title.toLowerCase().includes(title))) {
-            throw new Error('Suspicious page title indicates possible bot protection');
+        // If the page contains insufficient content, throw an error
+        if (validation.wordCount < 20) {
+            throw new Error('Page contains insufficient content');
         }
 
     } catch (error) {
-        // Handle navigation timeouts gracefully
-        if ((error as Error).message.includes('timeout')) {
-            console.warn('Navigation timeout, but continuing with available content');
-            return;
-        }
-        throw new Error(`Navigation failed: ${(error as Error).message}`);
+        // If an error occurs during navigation, throw an error with the URL and the error message
+        throw new Error(`Navigation to ${url} failed: ${(error as Error).message}`);
     }
 }
 
@@ -657,10 +653,10 @@ async function extractContentAsMarkdown(
 
         // Step 6: Clean up and format markdown
         return markdown
-            .replace(/\n{3,}/g, '\n\n')      // Replace excessive newlines with double
-            .replace(/^- $/gm, '')           // Remove empty list items
-            .replace(/^\s+$/gm, '')          // Remove whitespace-only lines
-            .trim();                         // Remove leading/trailing whitespace
+            .replace(/\n{3,}/g, '\n\n')  // Replace excessive newlines with double
+            .replace(/^- $/gm, '')       // Remove empty list items
+            .replace(/^\s+$/gm, '')      // Remove whitespace-only lines
+            .trim();                     // Remove leading/trailing whitespace
 
     } catch (error) {
         // Log conversion errors and return original HTML as fallback
@@ -732,7 +728,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<ToolRes
                         await searchInput.click({ clickCount: 3 });  // Select all existing text
                         await searchInput.press('Backspace');        // Clear selected text
                         await searchInput.type(query);               // Type new query
-                    }, 3, 2000); // Allow 3 retries with 2s delay
+                    }, 3, 2000);  // Allow 3 retries with 2s delay
 
                     // Step 4: Submit search and wait for results
                     await withRetry(async () => {
@@ -754,9 +750,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<ToolRes
                             // Extract data from each result
                             return Array.from(elements).map((el) => {
                                 // Find required elements within result container
-                                const titleEl = el.querySelector('h3');                // Title element
-                                const linkEl = el.querySelector('a');                 // Link element
-                                const snippetEl = el.querySelector('div.VwiC3b');     // Snippet element
+                                const titleEl = el.querySelector('h3');            // Title element
+                                const linkEl = el.querySelector('a');              // Link element
+                                const snippetEl = el.querySelector('div.VwiC3b');  // Snippet element
 
                                 // Skip results missing required elements
                                 if (!titleEl || !linkEl || !snippetEl) {
@@ -765,9 +761,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<ToolRes
 
                                 // Return structured result data
                                 return {
-                                    title: titleEl.textContent || '',         // Result title
-                                    url: linkEl.getAttribute('href') || '',   // Result URL
-                                    snippet: snippetEl.textContent || '',     // Result description
+                                    title: titleEl.textContent || '',        // Result title
+                                    url: linkEl.getAttribute('href') || '',  // Result URL
+                                    snippet: snippetEl.textContent || '',    // Result description
                                 };
                             }).filter(result => result !== null);  // Remove invalid results
                         });
@@ -844,17 +840,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<ToolRes
                     const content = await withRetry(async () => {
                         // Convert page content to markdown
                         const extractedContent = await extractContentAsMarkdown(page);
+
+                        // If no content is extracted, throw an error
                         if (!extractedContent) {
                             throw new Error('Failed to extract content');
                         }
+
+                        // Return the extracted content
                         return extractedContent;
                     });
 
                     // Step 4: Create result object with page data
                     const pageResult: ResearchResult = {
-                        url,                            // Original URL
-                        title,                          // Page title
-                        content,                        // Markdown content
+                        url,      // Original URL
+                        title,    // Page title
+                        content,  // Markdown content
                         timestamp: new Date().toISOString(),  // Capture time
                     };
 
