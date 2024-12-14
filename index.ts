@@ -421,7 +421,7 @@ async function takeScreenshotWithSizeLimit(page: Page): Promise<string> {
 const server: Server = new Server(
     {
         name: "webresearch",  // Server name identifier
-        version: "0.1.5",     // Server version number
+        version: "0.1.6",     // Server version number
     },
     {
         capabilities: {
