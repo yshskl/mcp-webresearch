@@ -16,6 +16,7 @@
   "scripts": {
     "build": "tsc && shx chmod +x dist/*.js",
     "prepare": "pnpm run build",
+    "postinstall": "playwright install chromium",
     "watch": "tsc --watch",
     "dev": "tsx watch index.ts"
   },
