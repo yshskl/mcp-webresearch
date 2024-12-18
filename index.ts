@@ -242,6 +242,150 @@ function addResult(result: ResearchResult): void {
     currentSession.lastUpdated = new Date().toISOString();
 }
 
+/**
+ * Specifically handles Google's consent dialog in regions that require it
+ * @param page - Playwright Page object
+ */
+async function dismissGoogleConsent(page: Page): Promise<void> {
+    // Regions that commonly show cookie/consent banners
+    const regions = [
+        // Europe
+        '.google.de', '.google.fr', '.google.co.uk',
+        '.google.it', '.google.es', '.google.nl',
+        '.google.pl', '.google.ie', '.google.dk',
+        '.google.no', '.google.se', '.google.fi',
+        '.google.at', '.google.ch', '.google.be',
+        '.google.pt', '.google.gr', '.google.com.tr',
+        // Asia Pacific
+        '.google.co.id', '.google.com.sg', '.google.co.th',
+        '.google.com.my', '.google.com.ph', '.google.com.au',
+        '.google.co.nz', '.google.com.vn',
+        // Generic domains
+        '.google.com', '.google.co'
+    ];
+
+    try {
+        // Get current URL
+        const currentUrl = page.url();
+
+        // Skip consent check if not in a supported region
+        if (!regions.some(domain => currentUrl.includes(domain))) {
+            return;
+        }
+
+        // Quick check for consent dialog existence
+        const hasConsent = await page.$(
+            'form:has(button[aria-label]), div[aria-modal="true"], ' +
+            // Common dialog containers
+            'div[role="dialog"], div[role="alertdialog"], ' +
+            // Common cookie/consent specific elements
+            'div[class*="consent"], div[id*="consent"], ' +
+            'div[class*="cookie"], div[id*="cookie"], ' +
+            // Common modal/popup classes
+            'div[class*="modal"]:has(button), div[class*="popup"]:has(button), ' +
+            // Common banner patterns
+            'div[class*="banner"]:has(button), div[id*="banner"]:has(button)'
+        ).then(Boolean);
+
+        // If no consent dialog is found, return
+        if (!hasConsent) {
+            return;
+        }
+
+        // Handle the consent dialog using common consent button patterns
+        await page.evaluate(() => {
+            const consentPatterns = {
+                // Common accept button text patterns across languages
+                text: [
+                    // English
+                    'accept all', 'agree', 'consent',
+                    // German
+                    'alle akzeptieren', 'ich stimme zu', 'zustimmen',
+                    // French
+                    'tout accepter', 'j\'accepte',
+                    // Spanish
+                    'aceptar todo', 'acepto',
+                    // Italian
+                    'accetta tutto', 'accetto',
+                    // Portuguese
+                    'aceitar tudo', 'concordo',
+                    // Dutch
+                    'alles accepteren', 'akkoord',
+                    // Polish
+                    'zaakceptuj wszystko', 'zgadzam się',
+                    // Swedish
+                    'godkänn alla', 'godkänn',
+                    // Danish
+                    'accepter alle', 'accepter',
+                    // Norwegian
+                    'godta alle', 'godta',
+                    // Finnish
+                    'hyväksy kaikki', 'hyväksy',
+                    // Indonesian
+                    'terima semua', 'setuju', 'saya setuju',
+                    // Malay
+                    'terima semua', 'setuju',
+                    // Thai
+                    'ยอมรับทั้งหมด', 'ยอมรับ',
+                    // Vietnamese
+                    'chấp nhận tất cả', 'đồng ý',
+                    // Filipino/Tagalog
+                    'tanggapin lahat', 'sumang-ayon',
+                    // Japanese
+                    'すべて同意する', '同意する',
+                    // Korean
+                    '모두 동의', '동의'
+                ],
+                // Common aria-label patterns
+                ariaLabels: [
+                    'consent', 'accept', 'agree',
+                    'cookie', 'privacy', 'terms',
+                    'persetujuan', 'setuju',  // Indonesian
+                    'ยอมรับ',  // Thai
+                    'đồng ý',  // Vietnamese
+                    '同意'     // Japanese/Chinese
+                ]
+            };
+
+            // Finds the accept button by text or aria-label
+            const findAcceptButton = () => {
+                // Get all buttons on the page
+                const buttons = Array.from(document.querySelectorAll('button'));
+
+                // Find the accept button
+                return buttons.find(button => {
+                    // Get the text content and aria-label of the button
+                    const text = button.textContent?.toLowerCase() || '';
+                    const label = button.getAttribute('aria-label')?.toLowerCase() || '';
+
+                    // Check for matching text patterns
+                    const hasMatchingText = consentPatterns.text.some(pattern =>
+                        text.includes(pattern)
+                    );
+
+                    // Check for matching aria-labels
+                    const hasMatchingLabel = consentPatterns.ariaLabels.some(pattern =>
+                        label.includes(pattern)
+                    );
+
+                    // Return true if either text or aria-label matches
+                    return hasMatchingText || hasMatchingLabel;
+                });
+            };
+
+            // Find the accept button
+            const acceptButton = findAcceptButton();
+
+            // If an accept button is found, click it
+            if (acceptButton) {
+                acceptButton.click();
+            }
+        });
+    } catch (error) {
+        console.log('Consent handling failed:', error);
+    }
+}
+
 // Safe page navigation with error handling and bot detection
 async function safePageNavigation(page: Page, url: string): Promise<void> {
     try {
@@ -283,7 +427,7 @@ async function safePageNavigation(page: Page, url: string): Promise<void> {
             const botProtectionExists = [
                 '#challenge-running',     // Cloudflare
                 '#cf-challenge-running',  // Cloudflare
-                '#px-captcha',           // PerimeterX
+                '#px-captcha',            // PerimeterX
                 '#ddos-protection',       // Various
                 '#waf-challenge-html'     // Various WAFs
             ].some(selector => document.querySelector(selector));
@@ -321,7 +465,7 @@ async function safePageNavigation(page: Page, url: string): Promise<void> {
         }
 
         // If the page contains insufficient content, throw an error
-        if (validation.wordCount < 20) {
+        if (validation.wordCount < 10) {
             throw new Error('Page contains insufficient content');
         }
 
@@ -701,6 +845,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<ToolRes
                 const results = await withRetry(async () => {
                     // Step 1: Navigate to Google search page
                     await safePageNavigation(page, 'https://www.google.com');
+                    await dismissGoogleConsent(page);
 
                     // Step 2: Find and interact with search input
                     await withRetry(async () => {
