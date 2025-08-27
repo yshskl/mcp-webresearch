@@ -1,8 +1,22 @@
 #!/usr/bin/env node
 
+/**
+ * MCP Web Research Server
+ * 
+ * 这是一个实现Model Context Protocol (MCP)的网络研究服务器，
+ * 为Claude AI提供网络搜索、网页内容提取和截图功能。
+ * 
+ * 主要功能模块：
+ * 1. MCP服务器实现 - 处理与Claude的通信协议
+ * 2. 网络搜索功能 - 通过Playwright执行Google搜索
+ * 3. 网页内容提取 - 访问网页并将内容转换为Markdown
+ * 4. 截图捕获 - 保存网页截图供Claude使用
+ * 5. 研究会话管理 - 跟踪搜索查询、访问过的页面和结果
+ */
+
 // Core dependencies for MCP server and protocol handling
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js"; // MCP服务器核心类
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"; // 标准输入输出传输层
 import {
     CallToolRequestSchema,
     ListResourcesRequestSchema,
@@ -16,29 +30,29 @@ import {
     ErrorCode,
     TextContent,
     ImageContent,
-} from "@modelcontextprotocol/sdk/types.js";
+} from "@modelcontextprotocol/sdk/types.js"; // MCP协议类型定义
 
 // Web scraping and content processing dependencies
-import { chromium, Browser, Page } from 'playwright';
-import TurndownService from "turndown";
+import { chromium, Browser, Page } from 'playwright'; // 浏览器自动化工具
+import TurndownService from "turndown"; // HTML到Markdown转换工具
 import type { Node } from "turndown";
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 
-// Initialize temp directory for screenshots
+// 初始化临时目录用于存储截图
 const SCREENSHOTS_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-screenshots-'));
 
-// Initialize Turndown service for converting HTML to Markdown
-// Configure with specific formatting preferences
+// 初始化Turndown服务用于HTML到Markdown转换
+// 配置特定的格式化偏好
 const turndownService: TurndownService = new TurndownService({
-    headingStyle: 'atx',       // Use # style headings
-    hr: '---',                 // Horizontal rule style
-    bulletListMarker: '-',     // List item marker
-    codeBlockStyle: 'fenced',  // Use ``` for code blocks
-    emDelimiter: '_',          // Italics style
-    strongDelimiter: '**',     // Bold style
-    linkStyle: 'inlined',      // Use inline links
+    headingStyle: 'atx',       // 使用#样式标题
+    hr: '---',                 // 水平分隔线样式
+    bulletListMarker: '-',     // 列表项标记
+    codeBlockStyle: 'fenced',  // 使用```作为代码块
+    emDelimiter: '_',          // 斜体样式
+    strongDelimiter: '**',     // 粗体样式
+    linkStyle: 'inlined',      // 使用内联链接
 });
 
 // Custom Turndown rules for better content extraction
@@ -187,15 +201,15 @@ const PROMPTS = {
     }
 } as const;  // Make object immutable
 
-// Global state management for browser and research session
-let browser: Browser | undefined;                 // Puppeteer browser instance
-let page: Page | undefined;                       // Current active page
-let currentSession: ResearchSession | undefined;  // Current research session data
+// 全局状态管理 - 跟踪浏览器实例和研究会话数据
+let browser: Browser | undefined;                 // Playwright浏览器实例
+let page: Page | undefined;                       // 当前活动页面
+let currentSession: ResearchSession | undefined;  // 当前研究会话数据
 
-// Configuration constants for session management
-const MAX_RESULTS_PER_SESSION = 100;  // Maximum number of results to store per session
-const MAX_RETRIES = 3;                // Maximum retry attempts for operations
-const RETRY_DELAY = 1000;             // Delay between retries in milliseconds
+// 会话管理配置常量
+const MAX_RESULTS_PER_SESSION = 100;  // 每个会话存储的最大结果数量
+const MAX_RETRIES = 3;                // 操作的最大重试次数
+const RETRY_DELAY = 1000;             // 重试间隔（毫秒）
 
 // Generic retry mechanism for handling transient failures
 async function withRetry<T>(
